@@ -102,19 +102,40 @@ struct ApiTable {
 
 ## M4 阶段的 ApiStringTable 内容
 
-stub 需要的最小 API 集合（顺序固定）：
+> Phase G 起，stub 只通过 IAT 引用两个**锚点** API；其余在 stub 启动时
+> 用 `GetProcAddress` 动态解析。所以 ApiStringTable 是真正被 stub 消费
+> 的（M4 期间它仅 round-trip 解密，从不消费）。
+
+stub 需要的最小 API 集合（顺序固定，9 项；slot 0..1 为锚点）：
+
 ```
-[0] kernel32.dll  GetModuleHandleA
-[1] kernel32.dll  LoadLibraryA
-[2] kernel32.dll  GetProcAddress
-[3] kernel32.dll  VirtualProtect
-[4] kernel32.dll  VirtualAlloc
-[5] kernel32.dll  VirtualFree
+[0] kernel32.dll  GetModuleHandleW   (anchor — wide-char form, present in NativeAOT IAT)
+[1] kernel32.dll  GetProcAddress     (anchor)
+[2] kernel32.dll  VirtualProtect
+[3] kernel32.dll  VirtualAlloc
+[4] kernel32.dll  VirtualFree
+[5] kernel32.dll  IsDebuggerPresent
+[6] kernel32.dll  GetCurrentProcess
+[7] kernel32.dll  GetCurrentThread
+[8] kernel32.dll  GetThreadContext
 ```
 
-`GetModuleHandleA` 和 `GetProcAddress` 必须在 packed PE 的 IAT 中静态保留（让 OS Loader 解析），其余 API 由 stub 用 `GetProcAddress` 解析。**M4 简化**：6 个全部静态保留在 IAT，stub 不做动态 GetProcAddress。这避免了在 M4 阶段叠加"完整 API resolver + 字符串解密"的复杂度。
+`GetModuleHandleW` 与 `GetProcAddress` 必须在 packed PE 的 IAT 中静态保留
+（让 OS Loader 解析）。**packer 行为**：先看 host 原 IAT 是否已经导入这两个名字，
+是则直接复用 host IAT 槽，不动 DataDirectory[Import]；缺其一则在
+`.idata2` 中追加一个 `IMAGE_IMPORT_DESCRIPTOR` 仅含缺失的锚点。
 
-API 字符串表仍保留并加密，目的是**打掉文件里的字符串**——IAT 字段里的字符串是另一层（PE Import Table 必须明文给 OS Loader），但我们不在 IAT 之外的任何地方留下这些 API 名字。
+API 字符串表用 ChaCha20 加密，stub 启动时:
+
+1. 用 IAT 锚点 `GetModuleHandleW(L"KERNEL32.dll")` 获取 kernel32 句柄
+   （wide string 通过运行时 XOR 重建，不留连续字符串）
+2. 把加密表拷到 stack 缓冲（≤ 1 KiB），就地 ChaCha20 解密
+3. 逐 entry 调 `GetProcAddress(k32, name)` 填 `ResolvedApis` 表
+4. 后续 chunk 解压 / 反调试 / TLS 流程全部走该函数指针表
+
+这样 **`VirtualAlloc` / `VirtualProtect` / `IsDebuggerPresent` 等名字
+永远不在 stub 字节中以明文出现**。验证脚本：从 packed PE 中按 RVA 切出
+stub 段（`.upobf0` 多态名）扫 ASCII，应该 0 命中。
 
 ## Packer 行为（M4）
 

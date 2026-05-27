@@ -44,19 +44,54 @@ pub const MAX_API_TABLE_SIZE: usize = 4096;
 /// First 12 bytes of the ASCII string `"upobf:apinonce"` (matches the stub).
 pub const FIXED_API_NONCE: [u8; 12] = *b"upobf:apinon";
 
-/// Number of API entries in the M4 table (must match `UPOBF_API_COUNT`).
-pub const API_COUNT: usize = 6;
+/// Number of API entries in the protocol table (must match
+/// `UPOBF_API_COUNT`). Phase G expanded this from 6 to 9: every API
+/// the stub uses goes through the (encrypted) string table and is
+/// resolved via GetProcAddress at runtime. Only two anchors remain
+/// in the import table, slot 0 and slot 1.
+pub const API_COUNT: usize = 9;
+
+/// Indices into the API table. The order is part of the protocol —
+/// stub-side `enum` in `api_resolve.h` mirrors it 1:1.
+pub const IDX_GET_MODULE_HANDLE_W: usize = 0;
+pub const IDX_GET_PROC_ADDRESS: usize = 1;
+pub const IDX_VIRTUAL_PROTECT: usize = 2;
+pub const IDX_VIRTUAL_ALLOC: usize = 3;
+pub const IDX_VIRTUAL_FREE: usize = 4;
+pub const IDX_IS_DEBUGGER_PRESENT: usize = 5;
+pub const IDX_GET_CURRENT_PROCESS: usize = 6;
+pub const IDX_GET_CURRENT_THREAD: usize = 7;
+pub const IDX_GET_THREAD_CONTEXT: usize = 8;
 
 /// Fixed name list driving the API string table. The stub indexes by
-/// position so this order is part of the protocol.
+/// position so this order is part of the protocol. Slots 0 and 1 are
+/// "anchors" — they stay in the packed PE's IAT so the OS Loader
+/// resolves them for us; everything else is GetProcAddress'd from
+/// inside the stub at runtime.
+///
+/// We pick the wide-character `GetModuleHandleW` over the ASCII form
+/// because the demo NativeAOT corpus (and most modern Windows
+/// binaries) imports it but not `GetModuleHandleA`. Sticking with
+/// what the host already pulls in lets us avoid rewriting
+/// DataDirectory[Import], which destabilises NativeAOT bootstrap.
 pub const API_NAMES: [(&str, &str); API_COUNT] = [
-    ("KERNEL32.dll", "GetModuleHandleA"),
-    ("KERNEL32.dll", "LoadLibraryA"),
-    ("KERNEL32.dll", "GetProcAddress"),
-    ("KERNEL32.dll", "VirtualProtect"),
-    ("KERNEL32.dll", "VirtualAlloc"),
-    ("KERNEL32.dll", "VirtualFree"),
+    ("KERNEL32.dll", "GetModuleHandleW"), // 0 anchor
+    ("KERNEL32.dll", "GetProcAddress"),   // 1 anchor
+    ("KERNEL32.dll", "VirtualProtect"),   // 2 dynamic
+    ("KERNEL32.dll", "VirtualAlloc"),     // 3 dynamic
+    ("KERNEL32.dll", "VirtualFree"),      // 4 dynamic
+    ("KERNEL32.dll", "IsDebuggerPresent"),// 5 dynamic
+    ("KERNEL32.dll", "GetCurrentProcess"),// 6 dynamic
+    ("KERNEL32.dll", "GetCurrentThread"), // 7 dynamic
+    ("KERNEL32.dll", "GetThreadContext"), // 8 dynamic
 ];
+
+/// Number of leading entries in [`API_NAMES`] that are anchors. Anchor
+/// APIs are referenced from the stub via `__imp_*` thunks so the OS
+/// Loader fills them in; the rest are resolved at runtime via
+/// `GetProcAddress`. Bumping this count is the protocol-level lever
+/// for trading IAT visibility for stub complexity.
+pub const API_ANCHOR_COUNT: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Inputs

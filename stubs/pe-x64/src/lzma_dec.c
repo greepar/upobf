@@ -1130,12 +1130,15 @@ SRes LzmaDecode(Byte *dest, SizeT *destLen, const Byte *src, SizeT *srcLen,
 /* ------------------------------------------------------------------ */
 
 /* Per-call allocator state: the ISzAlloc vtable carries pointers to the
- * caller-supplied alloc/free callbacks. We do not need any global state.
+ * caller-supplied alloc/free callbacks plus an opaque user context.
+ * We do not need any global state. The `user` pointer lets the caller
+ * thread its own data through the SDK's userdata-less callback API.
  */
 typedef struct {
     ISzAlloc base;
-    void *(*alloc_fn)(uint32_t);
-    void  (*free_fn)(void *);
+    void *(*alloc_fn)(void *user, uint32_t);
+    void  (*free_fn)(void *user, void *);
+    void  *user;
 } UpobfLzmaAlloc;
 
 static void *upobf_lzma_alloc(ISzAllocPtr p, size_t size)
@@ -1146,20 +1149,21 @@ static void *upobf_lzma_alloc(ISzAllocPtr p, size_t size)
      *   plus dictionary buffer which we cap by the input properties.
      * Both fit in 32 bits for any real upobf payload. */
     if (size > (size_t)0xFFFFFFFFu) return 0;
-    return a->alloc_fn((uint32_t)size);
+    return a->alloc_fn(a->user, (uint32_t)size);
 }
 
 static void upobf_lzma_free(ISzAllocPtr p, void *address)
 {
     const UpobfLzmaAlloc *a = (const UpobfLzmaAlloc *)p;
-    if (address) a->free_fn(address);
+    if (address) a->free_fn(a->user, address);
 }
 
 int upobf_lzma_decompress_alone(
     const uint8_t *src, uint32_t src_len,
     uint8_t       *dst, uint32_t dst_capacity, uint32_t *out_dst_size,
-    void *(*alloc_fn)(uint32_t),
-    void  (*free_fn)(void *))
+    void *(*alloc_fn)(void *user, uint32_t),
+    void  (*free_fn)(void *user, void *),
+    void  *user)
 {
     if (!src || !dst || !out_dst_size || !alloc_fn || !free_fn) return SZ_ERROR_PARAM;
     /* alone header is 13 bytes: 5 props + 8 uncompressed-size. */
@@ -1170,6 +1174,7 @@ int upobf_lzma_decompress_alone(
     alloc.base.Free  = upobf_lzma_free;
     alloc.alloc_fn   = alloc_fn;
     alloc.free_fn    = free_fn;
+    alloc.user       = user;
 
     /* The 13-byte alone header is *not* consumed by LzmaDecode itself.
      * LzmaDecode wants:

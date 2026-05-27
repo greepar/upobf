@@ -175,8 +175,9 @@ SRes LzmaDecode(Byte *dest, SizeT *destLen, const Byte *src, SizeT *srcLen,
 int upobf_lzma_decompress_alone(
     const uint8_t *src, uint32_t src_len,
     uint8_t       *dst, uint32_t dst_capacity, uint32_t *out_dst_size,
-    void *(*alloc_fn)(uint32_t),
-    void  (*free_fn)(void *));
+    void *(*alloc_fn)(void *user, uint32_t),
+    void  (*free_fn)(void *user, void *),
+    void  *user);
 
 #ifdef __cplusplus
 }

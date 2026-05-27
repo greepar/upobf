@@ -17,6 +17,7 @@
 - [x] **Phase C** stub 字节级多态（junk trampoline + dead tail，每构建 stub-section SHA256 全异）
 - [x] **Phase A2** 源码级 CFG / dataflow 混淆原语（`OPAQUE_TRUE/FALSE`、`BOGUS_GUARD`、`JUNK_DATAFLOW`）
 - [x] **Phase A1** LLVM IR 级 pass plugin（MBA 指令替换 + bogus control-flow，新-pass-manager 接入 `opt`）
+- [x] **Phase G** Import 表 API 名延迟解析（IAT 仅留 `GetModuleHandleW + GetProcAddress` 两个锚点；其余 9 个 API 全部从加密 ApiStringTable 在 TLS callback 内 GetProcAddress 解析）
 - [ ] **V2** Linux ELF + macOS Mach-O、`.rdata` 分块压缩、后台 CRC watchdog
 
 ## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）

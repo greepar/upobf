@@ -433,25 +433,48 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
         builder.set_linker_version(major, minor);
     }
 
-    // M4 status: do NOT add extra imports yet. The host's existing
-    // KERNEL32 import already brings in the APIs we need; the stub
-    // resolves them by ordinal/name. Adding extra imports rewrites
-    // DataDirectory[Import] which currently destabilises NativeAOT
-    // startup. M5 will revisit.
-    let _ = ();
-    /*
-    builder.add_import(
-        "KERNEL32.dll",
-        &[
-            "GetModuleHandleA",
-            "LoadLibraryA",
-            "GetProcAddress",
-            "VirtualProtect",
-            "VirtualAlloc",
-            "VirtualFree",
-        ],
-    );
-    */
+    // Phase G: the stub's TLS callback only references TWO Win32
+    // APIs through `__imp_*` thunks — `GetModuleHandleA` and
+    // `GetProcAddress`. Everything else is looked up at runtime via
+    // the encrypted ApiStringTable + GetProcAddress.
+    //
+    // The packer prefers to satisfy those two anchors via the host's
+    // existing IAT (no extra IMAGE_IMPORT_DESCRIPTOR added, smallest
+    // possible delta vs the original PE). When the host doesn't
+    // import an anchor — common: many .NET NativeAOT binaries pull
+    // in `GetModuleHandleW` but not the ASCII variant — we add a
+    // tiny extra descriptor for just the missing anchors.
+    {
+        use upobf_pe::build::payload::{API_ANCHOR_COUNT, API_NAMES};
+
+        let host_kernel32: Vec<&str> = image
+            .imports
+            .dlls
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case("KERNEL32.dll"))
+            .map(|d| {
+                d.functions
+                    .iter()
+                    .filter_map(|f| f.name.as_deref())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut missing_anchors: Vec<&str> = Vec::new();
+        for (_, fname) in &API_NAMES[..API_ANCHOR_COUNT] {
+            if !host_kernel32.iter().any(|h| h == fname) {
+                missing_anchors.push(fname);
+            }
+        }
+        if !missing_anchors.is_empty() {
+            tracing::info!(
+                missing = ?missing_anchors,
+                "host KERNEL32 missing anchor APIs; appending extra import descriptor",
+            );
+            builder.add_import("KERNEL32.dll", &missing_anchors);
+        }
+    }
+
     let bytes = builder.build().context("build packed PE")?;
     std::fs::write(&output, &bytes)
         .with_context(|| format!("write {}", output.display()))?;

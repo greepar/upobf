@@ -47,16 +47,34 @@ extern "C" {
 
 // ---------------------------------------------------------------------
 // API table indices (fixed order from the protocol).
+//
+// Phase G: 9 entries. The first two are *anchor* APIs that remain in
+// the packed PE's import table (the OS Loader resolves them via the
+// host's existing IAT or via a dedicated extra import descriptor);
+// the rest are looked up at runtime via `GetProcAddress` so their
+// names never appear as static strings outside the encrypted
+// `ApiStringTable`.
+//
+// We pick `GetModuleHandleW` (wide-char) over the ASCII form because
+// modern .NET NativeAOT binaries — the primary upobf target —
+// already import the W variant but not the A variant. Picking the
+// W form lets the packer satisfy the anchor through the host's
+// existing IAT and avoid rewriting DataDirectory[Import].
 // ---------------------------------------------------------------------
 enum {
-    UPOBF_API_GET_MODULE_HANDLE_A = 0,
-    UPOBF_API_LOAD_LIBRARY_A      = 1,
-    UPOBF_API_GET_PROC_ADDRESS    = 2,
-    UPOBF_API_VIRTUAL_PROTECT     = 3,
-    UPOBF_API_VIRTUAL_ALLOC       = 4,
-    UPOBF_API_VIRTUAL_FREE        = 5,
-    UPOBF_API_COUNT               = 6,
+    UPOBF_API_GET_MODULE_HANDLE_W = 0, // anchor (wide)
+    UPOBF_API_GET_PROC_ADDRESS    = 1, // anchor
+    UPOBF_API_VIRTUAL_PROTECT     = 2,
+    UPOBF_API_VIRTUAL_ALLOC       = 3,
+    UPOBF_API_VIRTUAL_FREE        = 4,
+    UPOBF_API_IS_DEBUGGER_PRESENT = 5,
+    UPOBF_API_GET_CURRENT_PROCESS = 6,
+    UPOBF_API_GET_CURRENT_THREAD  = 7,
+    UPOBF_API_GET_THREAD_CONTEXT  = 8,
+    UPOBF_API_COUNT               = 9,
 };
+
+#define UPOBF_API_ANCHOR_COUNT 2u
 
 // ---------------------------------------------------------------------
 // Fixed nonce salt for the API string table.
