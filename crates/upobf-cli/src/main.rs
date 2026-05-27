@@ -263,6 +263,7 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
     use upobf_core::stub_link::{link, parse_coff};
     use upobf_core::crypto::prng::Polymorphic;
     use upobf_core::obfuscate::section_names;
+    use upobf_core::obfuscate::stub_polymorph;
     use upobf_pe::build::payload::{build_payload, PayloadInput};
     use upobf_pe::build::writer::{section_protect_for_chars, PackedPeBuilder};
 
@@ -312,8 +313,27 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
         "stub linked",
     );
 
-    // ---- Build payload --------------------------------------------------
+    // Per-build polymorphic context. Used to derive the payload key,
+    // section names, scrubbed PE header fields, and (below) the stub
+    // byte-level polymorphism trampoline. Bringing it forward to here
+    // so all stub-mutating passes share the same seed.
     let poly = Polymorphic::from_os_rng();
+
+    // Apply the byte-level polymorphism pass: append a junk trampoline
+    // + dead tail to the linked stub so SHA256 of the stub bytes
+    // changes per build. The trampoline tail-jumps back into the real
+    // C callback, and `LinkedStub::entry_offset` is rewritten to point
+    // at the trampoline; everything else (fixups, imp_rel32_sites,
+    // tls_callback_offset) stays valid.
+    let linked = stub_polymorph::apply(linked, &poly).context("stub polymorph")?;
+    tracing::info!(
+        text_len = linked.text.len(),
+        entry_offset = format!("{:#x}", linked.entry_offset),
+        tls_callback_offset = format!("{:#x}", linked.tls_callback_offset),
+        "stub polymorphed",
+    );
+
+    // ---- Build payload --------------------------------------------------
     let mut inputs: Vec<PayloadInput> = Vec::new();
     let mut compressed_rvas: Vec<u32> = Vec::new();
 

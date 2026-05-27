@@ -234,8 +234,17 @@ struct BuildJob<'a> {
     /// `__imp_<name>` -> RVA of its IAT slot.
     imp_thunk_rvas: std::collections::BTreeMap<String, u32>,
 
-    /// RVA of stub TLS callback (= upobf0_rva + linked.tls_callback_offset).
+    /// RVA of the *real* stub TLS callback C function
+    /// (= upobf0_rva + linked.tls_callback_offset).
+    /// This is what gets written into the `__upobf_stub_self_rva`
+    /// fixup so the stub can recover ImageBase from `&self - rva`.
     stub_callback_rva: u32,
+    /// RVA of the stub entry point that the OS Loader actually
+    /// invokes (= upobf0_rva + linked.entry_offset).
+    /// Equals `stub_callback_rva` when no post-link polymorphism is
+    /// applied; otherwise points at the trampoline that jumps into
+    /// the real callback.
+    stub_entry_rva: u32,
     /// RVA of new TLS Directory in `.upobf0`.
     new_tls_dir_rva: u32,
 
@@ -260,6 +269,7 @@ impl<'a> BuildJob<'a> {
             reloc2_idx: None,
             imp_thunk_rvas: std::collections::BTreeMap::new(),
             stub_callback_rva: 0,
+            stub_entry_rva: 0,
             new_tls_dir_rva: 0,
             new_reloc: None,
             patched_callback_slot_rva: None,
@@ -359,6 +369,7 @@ impl<'a> BuildJob<'a> {
             size_of_raw_data: 0,
         });
         self.stub_callback_rva = upobf0_rva + self.builder.stub.tls_callback_offset;
+        self.stub_entry_rva = upobf0_rva + self.builder.stub.entry_offset;
         // The TLS Directory does *not* move; signal that to the writer.
         self.new_tls_dir_rva = self
             .builder
@@ -641,9 +652,16 @@ impl<'a> BuildJob<'a> {
             );
         }
 
-        // Layout: [stub_va, orig_cb_va, NULL]
-        let stub_va = self.image_base + self.stub_callback_rva as u64;
-        LittleEndian::write_u64(&mut sec.raw[off_in_sec..off_in_sec + 8], stub_va);
+        // Layout: [stub_entry_va, orig_cb_va, NULL]
+        // We register the *entry* (potentially a polymorphic
+        // trampoline) — not the real C callback — as the first TLS
+        // callback. The trampoline tail-jumps into the real callback,
+        // so the OS Loader sees identical control flow. The stub still
+        // recovers ImageBase via `__upobf_stub_self_rva`, which the
+        // packer fills with `stub_callback_rva` (the real callback's
+        // RVA) so that subtraction inside the C function is correct.
+        let stub_entry_va = self.image_base + self.stub_entry_rva as u64;
+        LittleEndian::write_u64(&mut sec.raw[off_in_sec..off_in_sec + 8], stub_entry_va);
         LittleEndian::write_u64(&mut sec.raw[off_in_sec + 8..off_in_sec + 16], cb0);
         LittleEndian::write_u64(&mut sec.raw[off_in_sec + 16..off_in_sec + 24], 0);
 

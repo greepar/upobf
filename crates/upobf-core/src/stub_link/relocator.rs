@@ -60,7 +60,21 @@ pub struct LinkedStub {
     /// `.text'` section.
     pub text: Vec<u8>,
     /// Offset within `text` where `upobf_stub_tls_callback` starts.
+    ///
+    /// This is the *real* C function. The value baked into the
+    /// `__upobf_stub_self_rva` slot at pack time must equal
+    /// `stub_section_rva + tls_callback_offset` so the stub can recover
+    /// `ImageBase = &upobf_stub_tls_callback - __upobf_stub_self_rva`.
     pub tls_callback_offset: u32,
+    /// Offset within `text` of the entry point that the OS Loader
+    /// actually invokes (i.e. the address written into the TLS
+    /// callback array). Equal to [`tls_callback_offset`] for a stock
+    /// link; the post-link byte-level polymorphism pass appends a
+    /// junk trampoline at the end of `text` and rewrites this field
+    /// to point at the trampoline. The trampoline ends with a
+    /// `jmp rel32` back to `tls_callback_offset`, so control flow
+    /// is identical from the stub's point of view.
+    pub entry_offset: u32,
     /// Image-relative addressing patches that the PE writer must apply
     /// once the final stub RVA is decided.
     pub abs_fixups: Vec<AbsFixup>,
@@ -347,6 +361,7 @@ pub fn link(objects: &[CoffObject]) -> Result<LinkedStub> {
     Ok(LinkedStub {
         text,
         tls_callback_offset,
+        entry_offset: tls_callback_offset,
         abs_fixups,
         imp_rel32_sites,
         external_symbols,
