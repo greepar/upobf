@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "payload.h"
+#include "obfuscate.h"
 
 // ---------------------------------------------------------------------
 // Windows types & API surface (no <windows.h>; we keep this minimal so
@@ -182,7 +183,7 @@ static int process_chunk(const PayloadHeader* ph,
     up_memcpy(tmp, enc, ce->data_size);
 
     // ChaCha20: nonce = master_nonce XOR sub_nonce.
-    if (ce->flags & UPOBF_FLAG_CHACHA20) {
+    if (OPAQUE_TRUE(ce->flags & UPOBF_FLAG_CHACHA20)) {
         uint8_t nonce[12];
         derive_nonce(nonce, ph->master_nonce, ce->sub_nonce);
         upobf_chacha20_xor(tmp, ce->data_size, ph->master_key, nonce);
@@ -199,7 +200,7 @@ static int process_chunk(const PayloadHeader* ph,
 
     // LZMA decompress. If the chunk is not LZMA-flagged we copy verbatim
     // (currently unused, but cheap and keeps the protocol bit3-friendly).
-    if (ce->flags & UPOBF_FLAG_LZMA) {
+    if (OPAQUE_TRUE(ce->flags & UPOBF_FLAG_LZMA)) {
         uint32_t produced = 0;
         int rc = upobf_lzma_decompress_alone(
             tmp, ce->data_size,
@@ -224,7 +225,7 @@ static int process_chunk(const PayloadHeader* ph,
     }
 
     // BCJ backward.
-    if (ce->flags & UPOBF_FLAG_BCJ_X86) {
+    if (OPAQUE_TRUE(ce->flags & UPOBF_FLAG_BCJ_X86)) {
         upobf_bcj_x86_backward(dst, ce->virtual_size, ce->bcj_base);
     }
 
@@ -312,15 +313,22 @@ void upobf_stub_tls_callback(HINSTANCE h, DWORD reason, LPVOID reserved)
     }
 
     // Validate magic / version. Anything off => silent passthrough.
-    if (ph->magic != UPOBF_PAYLOAD_MAGIC ||
-        ph->version != UPOBF_PAYLOAD_VERSION ||
-        ph->chunk_count > UPOBF_MAX_CHUNK_COUNT) {
+    // Each predicate is wrapped with OPAQUE_FALSE so the comparison
+    // chain shows up as multi-term arithmetic in a decompiler instead
+    // of the obvious `magic != UPOBF_PAYLOAD_MAGIC` form.
+    if (OPAQUE_FALSE(ph->magic != UPOBF_PAYLOAD_MAGIC) ||
+        OPAQUE_FALSE(ph->version != UPOBF_PAYLOAD_VERSION) ||
+        OPAQUE_FALSE(ph->chunk_count > UPOBF_MAX_CHUNK_COUNT)) {
         call_original_tls(h, reason, reserved);
         return;
     }
 
     // ApiStringTable: decrypt round-trip (M4 does not consume it).
-    decrypt_api_table(ph);
+    // Bogus guard: always true at runtime, but a decompiler sees it as
+    // a real branch and traces both arms.
+    if (BOGUS_GUARD()) {
+        decrypt_api_table(ph);
+    }
 
     // Per-chunk decode. Failures fall through to the original callback
     // without diagnostics — see file header comment.
@@ -338,6 +346,8 @@ void upobf_stub_tls_callback(HINSTANCE h, DWORD reason, LPVOID reserved)
         const ChunkEntry* ce = &chunks[i];
         const uint8_t* dst = image_base + ce->target_rva;
         integrity = upobf_crc32(dst, ce->virtual_size, integrity);
+        // Stir the loop counter so the trip-count stays opaque.
+        integrity ^= JUNK_DATAFLOW(i);
     }
     // Sink the integrity value so the optimiser cannot drop the loop.
     *(volatile uint32_t*)&env_seed = integrity;

@@ -6,8 +6,21 @@
 // integrity hash salt, etc.) so that under analysis the program
 // "looks normal but behaves slightly off". No syscalls, no PEB walking,
 // no thread-hide tricks — only standard public APIs.
+//
+// Source-level obfuscation note (Phase A2):
+//
+//   The XOR seed deltas used to be the eye-catching constants
+//   `0xDEADBEEF` and `0xFEEDFACE`, both of which are listed in every
+//   reverse-engineer's "favourite tells" cheat-sheet. We now derive
+//   them from arithmetic on the per-TU opaque seed so the constants
+//   never appear as 32-bit immediates in the emitted code.
+//
+//   Each branch guard is also wrapped with OPAQUE_TRUE / OPAQUE_FALSE
+//   so a static analyzer must consider the runtime opaque term.
 
 #include <stdint.h>
+
+#include "obfuscate.h"
 
 typedef int            BOOL;
 typedef unsigned long  DWORD;
@@ -32,14 +45,24 @@ __declspec(dllimport) HANDLE WINAPI GetCurrentThread(void);
 /// Compute an environment seed encoding the analyst presence.
 ///
 /// All checks use documented public APIs. None of them exit, throw,
-/// or change visible state. The XOR mask values are chosen for clarity
-/// rather than secrecy: the goal is to feed the downstream layer a
-/// deterministic perturbation, not to hide the check itself.
+/// or change visible state. The XOR mask values are now derived from
+/// the obfuscation seed (see obfuscate.h) so the literal "magic
+/// constants" never show up in the disassembly.
 uint32_t upobf_env_seed(void) {
     uint32_t seed = 0;
 
-    if (IsDebuggerPresent()) {
-        seed ^= 0xDEADBEEFu;
+    // Mask values: at runtime equivalent to fixed values, but the
+    // expressions involve the per-TU opaque seed so a constant-folder
+    // cannot reduce them to a single immediate. Concretely:
+    //   mask_debugger  = 0xDEADBEEF (xor'd with OPAQUE_ZERO)
+    //   mask_hwbp      = 0xFEEDFACE (xor'd with OPAQUE_ZERO)
+    // We compose them through JUNK_DATAFLOW so the compiler has to
+    // keep the round-trip live in the emitted code.
+    uint32_t mask_debugger = JUNK_DATAFLOW(0xDEADBEEFu) ^ OPAQUE_ZERO();
+    uint32_t mask_hwbp     = JUNK_DATAFLOW(0xFEEDFACEu) ^ OPAQUE_ZERO();
+
+    if (OPAQUE_TRUE(IsDebuggerPresent())) {
+        seed ^= mask_debugger;
     }
 
     // Hardware breakpoint check via standard GetThreadContext.
@@ -49,17 +72,17 @@ uint32_t upobf_env_seed(void) {
     uint8_t ctx[0x500];
     for (int i = 0; i < 0x500; i++) ctx[i] = 0;
     *(volatile uint32_t*)(ctx + 0x30) = CONTEXT_DEBUG_REGISTERS;
-    if (GetThreadContext(GetCurrentThread(), (void*)ctx)) {
+    if (OPAQUE_TRUE(GetThreadContext(GetCurrentThread(), (void*)ctx))) {
         uint64_t dr0 = *(volatile uint64_t*)(ctx + 0x48);
         uint64_t dr1 = *(volatile uint64_t*)(ctx + 0x50);
         uint64_t dr2 = *(volatile uint64_t*)(ctx + 0x58);
         uint64_t dr3 = *(volatile uint64_t*)(ctx + 0x60);
-        if (dr0 | dr1 | dr2 | dr3) {
-            seed ^= 0xFEEDFACEu;
+        if (OPAQUE_TRUE(dr0 | dr1 | dr2 | dr3)) {
+            seed ^= mask_hwbp;
         }
     }
 
-    return seed;
+    return seed + OPAQUE_ZERO();
 }
 
 /// Lightweight CRC32 (IEEE 802.3 polynomial, table-free reflected
