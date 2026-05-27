@@ -334,47 +334,97 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
     );
 
     // ---- Build payload --------------------------------------------------
+    //
+    // Phase E lifts compression beyond `.text`: we now also slice the
+    // `.rdata` section into "safe" runs that the OS Loader does not
+    // touch before our TLS callback fires, and absorb each run into
+    // the payload as its own chunk. Forbidden ranges (Import / IAT /
+    // LoadConfig / TLS / Resource / Exception / Reloc / Debug / etc.)
+    // stay verbatim in the packed image at their original RVAs.
     let mut inputs: Vec<PayloadInput> = Vec::new();
-    let mut compressed_rvas: Vec<u32> = Vec::new();
+    let mut compressed_ranges: Vec<(u32, u32)> = Vec::new();
 
     for sec in &image.sections {
-        // M4 strategy: pack `.text` only.
-        // If --no-compress, build a payload with zero chunks (stub
-        // becomes a passthrough that just invokes the original TLS
-        // callback). Useful to bisect crashes.
         if _no_compress {
             continue;
         }
-        let target_for_pack = matches!(sec.name.as_str(), ".text");
-        if !target_for_pack {
-            continue;
+        match sec.name.as_str() {
+            ".text" => {
+                let raw_off = sec.pointer_to_raw_data as usize;
+                let raw_len = (sec.size_of_raw_data as usize)
+                    .min(image.raw.len().saturating_sub(raw_off));
+                let pack_len = (sec.virtual_size as usize).min(raw_len);
+                if pack_len == 0 {
+                    continue;
+                }
+                let data = image.raw[raw_off..raw_off + pack_len].to_vec();
+                inputs.push(PayloadInput {
+                    target_rva: sec.virtual_address,
+                    virtual_size: pack_len as u32,
+                    original_protect: section_protect_for_chars(sec.characteristics),
+                    data,
+                    // BCJ is a clear win on instruction streams.
+                    apply_bcj: true,
+                });
+                compressed_ranges.push((sec.virtual_address, pack_len as u32));
+            }
+            ".rdata" => {
+                use upobf_pe::layout::safe_ranges::{
+                    coalesce, collect_forbidden_in_section, pad_to_pages, safe_runs_in_section,
+                };
+
+                let forbidden = coalesce(collect_forbidden_in_section(&image, sec));
+                let pinned = pad_to_pages(&forbidden);
+                let runs = safe_runs_in_section(sec, &pinned);
+
+                let raw_off = sec.pointer_to_raw_data as usize;
+                let sec_raw_len = (sec.size_of_raw_data as usize)
+                    .min(image.raw.len().saturating_sub(raw_off));
+                let sec_end_rva = sec.virtual_address as usize + sec_raw_len;
+
+                for run in &runs {
+                    let run_start = run.rva as usize;
+                    let run_end = (run.rva as usize) + (run.len as usize);
+                    if run_start < sec.virtual_address as usize || run_end > sec_end_rva {
+                        continue;
+                    }
+                    let file_off = raw_off + (run_start - sec.virtual_address as usize);
+                    let data = image.raw[file_off..file_off + (run.len as usize)].to_vec();
+                    inputs.push(PayloadInput {
+                        target_rva: run.rva,
+                        virtual_size: run.len,
+                        original_protect: section_protect_for_chars(sec.characteristics),
+                        data,
+                        // .rdata holds non-instruction data (strings,
+                        // type metadata, NativeAOT method tables);
+                        // BCJ would mangle it.
+                        apply_bcj: false,
+                    });
+                    compressed_ranges.push((run.rva, run.len));
+                }
+
+                if !runs.is_empty() {
+                    let total: u64 = runs.iter().map(|r| r.len as u64).sum();
+                    tracing::info!(
+                        section = %sec.name,
+                        section_raw = sec.size_of_raw_data,
+                        chunks = runs.len(),
+                        absorbed_bytes = total,
+                        forbidden_blocks = pinned.len(),
+                        "Phase E: absorbed safe runs from section",
+                    );
+                }
+            }
+            _ => {}
         }
-        let raw_off = sec.pointer_to_raw_data as usize;
-        let raw_len = (sec.size_of_raw_data as usize)
-            .min(image.raw.len().saturating_sub(raw_off));
-        // For .data sections VirtualSize > RawSize is the BSS tail; we
-        // only pack the initialized portion. For .text/.rdata the two
-        // are typically equal modulo file alignment.
-        let pack_len = (sec.virtual_size as usize).min(raw_len);
-        if pack_len == 0 {
-            continue;
-        }
-        let data = image.raw[raw_off..raw_off + pack_len].to_vec();
-        inputs.push(PayloadInput {
-            target_rva: sec.virtual_address,
-            virtual_size: pack_len as u32,
-            original_protect: section_protect_for_chars(sec.characteristics),
-            data,
-        });
-        compressed_rvas.push(sec.virtual_address);
     }
 
     let payload = build_payload(&inputs, &poly).context("build payload")?;
 
     // ---- Assemble packed PE --------------------------------------------
     let mut builder = PackedPeBuilder::new(&image, linked, payload.bytes);
-    for rva in &compressed_rvas {
-        builder.mark_compressed_rva(*rva);
+    for (rva, len) in &compressed_ranges {
+        builder.mark_compressed_range(*rva, *len);
     }
 
     // Per-build polymorphic section names so static signatures keyed

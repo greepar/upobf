@@ -18,18 +18,20 @@
 - [x] **Phase A2** 源码级 CFG / dataflow 混淆原语（`OPAQUE_TRUE/FALSE`、`BOGUS_GUARD`、`JUNK_DATAFLOW`）
 - [x] **Phase A1** LLVM IR 级 pass plugin（MBA 指令替换 + bogus control-flow，新-pass-manager 接入 `opt`）
 - [x] **Phase G** Import 表 API 名延迟解析（IAT 仅留 `GetModuleHandleW + GetProcAddress` 两个锚点；其余 9 个 API 全部从加密 ApiStringTable 在 TLS callback 内 GetProcAddress 解析）
-- [ ] **V2** Linux ELF + macOS Mach-O、`.rdata` 分块压缩、后台 CRC watchdog
+- [x] **Phase E** `.rdata` 分块压缩（forbidden-page mask + section splitting；demo 进一步从 27.86 MiB 砍到 18.39 MiB / 41.0%）
+- [ ] **V2** Linux ELF + macOS Mach-O、后台 CRC watchdog、upobf-cff control-flow flattening
 
 ## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）
 
 | 指标 | 值 |
 |---|---|
 | 原大小 | 44.85 MB |
-| Packed 大小 | 26.57 MB |
-| 压缩率 | **62.1%（节省 38%）** |
-| Pack 耗时 (release) | ~8.5 s |
+| Packed 大小 | **18.39 MB** |
+| 压缩率 | **41.0%（节省 59%）** |
+| 较 .text-only 基线再节省 | 9.47 MiB（Phase E `.rdata` 分块） |
+| Pack 耗时 (release) | ~12 s |
 | Packed 启动到首屏 | ~2-3 s |
-| Packed 运行时内存 | ~120 MB（与原版一致） |
+| Packed 运行时内存 | ~130 MB（与原版一致） |
 | Per-build SHA256 差异 | ✅（master_key/master_nonce 由 OsRng 派生） |
 
 ## 工程布局

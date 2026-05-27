@@ -110,6 +110,12 @@ pub struct PayloadInput {
     pub original_protect: u32,
     /// Raw bytes from the original section.
     pub data: Vec<u8>,
+    /// Apply the BCJ x86 filter before LZMA. Improves compression for
+    /// instruction streams (`.text`) but **mangles** non-code data
+    /// because the filter rewrites bytes that look like x86
+    /// `call`/`jmp rel32` opcodes. `.rdata` and similar
+    /// non-instruction sections must set this to `false`.
+    pub apply_bcj: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,10 +156,17 @@ pub fn build_payload(inputs: &[PayloadInput], poly: &Polymorphic) -> Result<Buil
     }
     let mut encoded: Vec<EncodedChunk> = Vec::with_capacity(inputs.len());
     for (i, inp) in inputs.iter().enumerate() {
-        // BCJ forward — applied to *every* chunk so the stub flag matches
-        // what the packer did. Even on data sections it is reversible.
+        // BCJ forward — opt-in per chunk. The filter rewrites bytes
+        // that look like x86 call/jmp rel32 opcodes and is a clear
+        // win on `.text` (typically 5-15% extra compression) but
+        // **mangles** non-code data, so callers feeding in `.rdata`
+        // chunks etc. must set `apply_bcj=false`.
         let mut buf = inp.data.clone();
-        bcj_x86::forward(&mut buf, inp.target_rva);
+        let mut chunk_flags = UPOBF_FLAG_LZMA | UPOBF_FLAG_CHACHA20;
+        if inp.apply_bcj {
+            bcj_x86::forward(&mut buf, inp.target_rva);
+            chunk_flags |= UPOBF_FLAG_BCJ_X86;
+        }
 
         // LZMA compress.
         let compressed = lzma_compress(&buf)
@@ -178,7 +191,7 @@ pub fn build_payload(inputs: &[PayloadInput], poly: &Polymorphic) -> Result<Buil
             virtual_size: inp.virtual_size,
             original_protect: inp.original_protect,
             bcj_base: inp.target_rva,
-            flags: UPOBF_FLAG_BCJ_X86 | UPOBF_FLAG_LZMA | UPOBF_FLAG_CHACHA20,
+            flags: chunk_flags,
             sub_nonce,
             bytes: ct,
         });
@@ -427,6 +440,7 @@ mod tests {
             virtual_size: original.len() as u32,
             original_protect: 0x4000_0040, // R | initialized data
             data: original.clone(),
+            apply_bcj: true,
         };
         let p = build_payload(&[inp], &poly()).unwrap();
 

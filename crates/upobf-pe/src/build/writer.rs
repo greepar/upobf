@@ -64,6 +64,26 @@ const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 // Public API
 // ---------------------------------------------------------------------------
 
+/// One half-open range of host-image bytes that the packer absorbed
+/// into the payload blob. Used for sub-section compression: a single
+/// `.rdata` section may contribute several disjoint compressed runs
+/// (one per "safe" page span) while keeping the rest of its raw
+/// bytes verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressedRange {
+    pub rva: u32,
+    pub len: u32,
+}
+
+impl CompressedRange {
+    pub fn new(rva: u32, len: u32) -> Self {
+        Self { rva, len }
+    }
+    pub fn end(&self) -> u32 {
+        self.rva.saturating_add(self.len)
+    }
+}
+
 /// Builder that owns the inputs and emits a final packed PE.
 #[derive(Debug)]
 pub struct PackedPeBuilder<'a> {
@@ -71,9 +91,13 @@ pub struct PackedPeBuilder<'a> {
     pub stub: LinkedStub,
     pub payload_bytes: Vec<u8>,
     pub extra_imports: Vec<(String, Vec<String>)>,
-    /// RVAs of original sections that were absorbed into the payload
-    /// (so their on-disk bytes can be dropped from the packed image).
-    pub compressed_rvas: Vec<u32>,
+    /// Half-open RVA ranges that were absorbed into the payload (so
+    /// their on-disk bytes can be dropped from the packed image).
+    /// Phase E grew this from `Vec<u32>` to support sub-section
+    /// compression: a `.rdata` section may contribute several
+    /// disjoint chunks while keeping its forbidden pages (Import
+    /// table, IAT, LoadConfig, etc.) intact.
+    pub compressed_ranges: Vec<CompressedRange>,
     /// Per-build polymorphic section names for the three appended
     /// sections (stub text / payload / aux reloc). All callers should
     /// override these via [`PackedPeBuilder::set_section_names`]; the
@@ -102,7 +126,7 @@ impl<'a> PackedPeBuilder<'a> {
             stub,
             payload_bytes,
             extra_imports: Vec::new(),
-            compressed_rvas: Vec::new(),
+            compressed_ranges: Vec::new(),
             stub_section_name: pad_name(b".upobf0"),
             payload_section_name: pad_name(b".upobf1"),
             reloc_section_name: pad_name(b".reloc2"),
@@ -117,8 +141,26 @@ impl<'a> PackedPeBuilder<'a> {
             .push((dll.into(), fns.iter().map(|s| s.to_string()).collect()));
     }
 
+    /// Mark an entire host section as absorbed into the payload.
+    /// `len` is the number of contiguous bytes starting at `rva` to
+    /// drop from the packed image; the typical caller passes the
+    /// section's raw size so the section becomes zero-on-disk and
+    /// the stub re-injects the bytes at runtime.
+    pub fn mark_compressed_range(&mut self, rva: u32, len: u32) {
+        if len > 0 {
+            self.compressed_ranges
+                .push(CompressedRange::new(rva, len));
+        }
+    }
+
+    /// Backwards-compatible shim: marks the entire VirtualSize of the
+    /// section that begins at `rva`. Used by tests and by callers
+    /// that haven't migrated to per-range bookkeeping yet.
     pub fn mark_compressed_rva(&mut self, rva: u32) {
-        self.compressed_rvas.push(rva);
+        if let Some(sec) = self.original.sections.iter().find(|s| s.virtual_address == rva) {
+            let len = sec.virtual_size.min(sec.size_of_raw_data);
+            self.mark_compressed_range(rva, len);
+        }
     }
 
     /// Override the three appended-section names. Callers should pass
@@ -301,11 +343,55 @@ impl<'a> BuildJob<'a> {
             let n = nb.len().min(8);
             name[..n].copy_from_slice(&nb[..n]);
 
-            let is_compressed = self.builder.compressed_rvas.contains(&sec.virtual_address);
+            // Collect ranges intersecting this section.
+            let sec_start = sec.virtual_address;
+            let sec_end = sec_start
+                .saturating_add(sec.virtual_size.max(sec.size_of_raw_data));
+            let mut intersecting: Vec<CompressedRange> = self
+                .builder
+                .compressed_ranges
+                .iter()
+                .filter_map(|r| {
+                    let lo = r.rva.max(sec_start);
+                    let hi = r.end().min(sec_end);
+                    if hi > lo {
+                        Some(CompressedRange::new(lo, hi - lo))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            intersecting.sort_by_key(|r| r.rva);
 
-            let raw_bytes: Vec<u8> = if is_compressed {
-                Vec::new() // dropped from the packed file
-            } else {
+            // Detect "drop entire section": one range that spans
+            // `[sec_start, sec_start + virtual_size)`. In that case
+            // we emit zero raw bytes (UPX-style) and let the OS Loader
+            // map the section as zero-filled. We compare against
+            // virtual_size (not size_of_raw_data) because virtual_size
+            // is the host's effective working set; size_of_raw_data
+            // tends to be slightly larger due to file alignment
+            // padding and that padding never holds data the host
+            // reads.
+            let effective = sec.virtual_size.min(sec.size_of_raw_data);
+            let drop_entire = intersecting.len() == 1
+                && intersecting[0].rva == sec_start
+                && intersecting[0].len >= effective;
+
+            if drop_entire {
+                self.sections.push(PlannedSection {
+                    name,
+                    virtual_address: sec.virtual_address,
+                    virtual_size: sec.virtual_size,
+                    characteristics: sec.characteristics,
+                    raw: Vec::new(),
+                    pointer_to_raw_data: 0,
+                    size_of_raw_data: 0,
+                });
+                continue;
+            }
+
+            if intersecting.is_empty() {
+                // Verbatim copy of the original section.
                 let off = sec.pointer_to_raw_data as usize;
                 let len = sec.size_of_raw_data as usize;
                 if off + len > raw.len() {
@@ -317,20 +403,179 @@ impl<'a> BuildJob<'a> {
                         raw.len()
                     );
                 }
-                raw[off..off + len].to_vec()
-            };
+                let raw_bytes = raw[off..off + len].to_vec();
+                self.sections.push(PlannedSection {
+                    name,
+                    virtual_address: sec.virtual_address,
+                    virtual_size: sec.virtual_size,
+                    characteristics: sec.characteristics,
+                    raw: raw_bytes,
+                    pointer_to_raw_data: 0,
+                    size_of_raw_data: 0,
+                });
+                continue;
+            }
 
-            self.sections.push(PlannedSection {
-                name,
-                virtual_address: sec.virtual_address,
-                virtual_size: sec.virtual_size,
-                characteristics: sec.characteristics,
-                raw: raw_bytes,
-                pointer_to_raw_data: 0,
-                size_of_raw_data: 0,
-            });
+            // ----------------------------------------------------------
+            // Sub-section absorption: split the host section into one
+            // or more output sections so the absorbed bytes become
+            // trailing zero-fill (excluded from `size_of_raw_data`).
+            //
+            // For an input layout like
+            //   [head_orig] [absorbed_1] [middle_orig] [absorbed_2] [tail_orig]
+            // we emit:
+            //   Sec A: rva=head, virt_size=head_len + absorbed_1_len,
+            //          raw_size=head_len, raw_bytes=head_orig
+            //   Sec B: rva=middle, virt_size=middle_len + absorbed_2_len,
+            //          raw_size=middle_len, raw_bytes=middle_orig
+            //   Sec C: rva=tail, virt_size=tail_len, raw_size=tail_len,
+            //          raw_bytes=tail_orig
+            //
+            // The effect: each absorbed run ends up as the trailing
+            // virtual zero-fill of the preceding section, exactly the
+            // mechanism the OS Loader provides for `.bss`-style
+            // tails. The on-disk savings equal the sum of absorbed
+            // bytes; the stub re-injects the actual content at run
+            // time.
+            //
+            // Multiple consecutive absorbed runs (with no real bytes
+            // between them) are merged into one zero-fill tail.
+            // ----------------------------------------------------------
+            let off = sec.pointer_to_raw_data as usize;
+            let raw_len = sec.size_of_raw_data as usize;
+            if off + raw_len > raw.len() {
+                bail!(
+                    "section '{}' raw range {:#x}+{} exceeds file len {}",
+                    sec.name,
+                    off,
+                    raw_len,
+                    raw.len()
+                );
+            }
+            let sec_raw_bytes = &raw[off..off + raw_len];
+            let initialised_end = sec_start.saturating_add(effective);
+
+            let mut cursor = sec_start;
+            let mut idx = 0usize;
+            let bss_tail_len = sec
+                .virtual_size
+                .saturating_sub(effective);
+
+            while idx < intersecting.len() {
+                let r = intersecting[idx];
+
+                // Skip absorbed ranges that are out-of-order or overlap;
+                // the input is already sorted + non-overlapping, but be
+                // defensive.
+                if r.end() <= cursor {
+                    idx += 1;
+                    continue;
+                }
+
+                if cursor < r.rva {
+                    // Emit a planned section covering the real bytes
+                    // [cursor..r.rva), with trailing zero-fill of the
+                    // absorbed range (and any consecutive absorbed
+                    // runs that immediately follow).
+                    let real_start = cursor;
+                    let real_end = r.rva;
+                    let mut zero_end = r.end();
+                    let mut peek = idx + 1;
+                    while peek < intersecting.len() && intersecting[peek].rva == zero_end {
+                        zero_end = zero_end.max(intersecting[peek].end());
+                        peek += 1;
+                    }
+                    self.push_split_section(
+                        &name,
+                        sec.characteristics,
+                        sec_start,
+                        sec_raw_bytes,
+                        real_start,
+                        real_end,
+                        zero_end,
+                        initialised_end,
+                    );
+                    cursor = zero_end;
+                    idx = peek;
+                } else {
+                    // cursor sits inside or at the start of an absorbed
+                    // range; just advance past it. No section emitted
+                    // because it has no real bytes.
+                    cursor = cursor.max(r.end());
+                    idx += 1;
+                }
+            }
+
+            // Trailing real bytes after the last absorbed run.
+            if cursor < initialised_end {
+                self.push_split_section(
+                    &name,
+                    sec.characteristics,
+                    sec_start,
+                    sec_raw_bytes,
+                    cursor,
+                    initialised_end,
+                    initialised_end.saturating_add(bss_tail_len),
+                    initialised_end,
+                );
+            }
+            // If `cursor >= initialised_end`, the section ends with an
+            // absorbed run — the previous push_split_section already
+            // accounted for the zero-fill tail, but we still need a
+            // final virtual zero-fill section if there was an
+            // uninitialised BSS tail. We synthesise it here as a raw=0
+            // section: virtual covers the BSS, no on-disk bytes.
+            if bss_tail_len > 0 && cursor >= initialised_end {
+                self.sections.push(PlannedSection {
+                    name,
+                    virtual_address: initialised_end,
+                    virtual_size: bss_tail_len,
+                    characteristics: sec.characteristics,
+                    raw: Vec::new(),
+                    pointer_to_raw_data: 0,
+                    size_of_raw_data: 0,
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Emit a split fragment: real bytes `[real_start..real_end)`
+    /// drawn from the host section's raw image, with a trailing
+    /// zero-fill that extends `virtual_size` to `zero_end`. Fragments
+    /// with zero real-byte length are skipped.
+    fn push_split_section(
+        &mut self,
+        name: &[u8; 8],
+        characteristics: u32,
+        sec_va: u32,
+        sec_raw_bytes: &[u8],
+        real_start: u32,
+        real_end: u32,
+        zero_end: u32,
+        initialised_end: u32,
+    ) {
+        if real_end <= real_start {
+            return;
+        }
+        let local_start = (real_start - sec_va) as usize;
+        let local_end = (real_end - sec_va) as usize;
+        let safe_end = local_end.min(sec_raw_bytes.len());
+        if safe_end <= local_start {
+            return;
+        }
+        let raw_bytes = sec_raw_bytes[local_start..safe_end].to_vec();
+        let zero_end = zero_end.max(real_end).min(initialised_end.max(zero_end));
+        let virtual_size = (zero_end - real_start).max(real_end - real_start);
+        self.sections.push(PlannedSection {
+            name: *name,
+            virtual_address: real_start,
+            virtual_size,
+            characteristics,
+            raw: raw_bytes,
+            pointer_to_raw_data: 0,
+            size_of_raw_data: 0,
+        });
     }
 
     fn plan_new_sections(&mut self) -> Result<()> {

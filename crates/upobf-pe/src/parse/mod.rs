@@ -58,6 +58,11 @@ pub struct ImportSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportedDll {
     pub name: String,
+    /// RVA of the NUL-terminated DLL name string. The OS Loader reads
+    /// this byte sequence before it can `LoadLibraryA` the dependency,
+    /// so any in-place compression of `.rdata` MUST keep this byte
+    /// range intact.
+    pub name_rva: u32,
     pub original_first_thunk_rva: u32,
     pub first_thunk_rva: u32,
     pub time_date_stamp: u32,
@@ -73,6 +78,11 @@ pub struct ImportedFunction {
     pub hint_or_ordinal: u16,
     /// True if imported by ordinal (high bit of thunk was set).
     pub by_ordinal: bool,
+    /// When `by_ordinal == false`, this is the RVA of the
+    /// IMAGE_IMPORT_BY_NAME structure (`u16 hint + ASCIIZ name`).
+    /// `None` when imported by ordinal — the loader does not need a
+    /// string in that case.
+    pub import_by_name_rva: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -372,6 +382,7 @@ fn parse_imports(
 
         dlls.push(ImportedDll {
             name,
+            name_rva,
             original_first_thunk_rva: original_first_thunk,
             first_thunk_rva: first_thunk,
             time_date_stamp,
@@ -418,6 +429,7 @@ fn parse_thunks(
                 name: None,
                 hint_or_ordinal: ord,
                 by_ordinal: true,
+                import_by_name_rva: None,
             });
         } else {
             // Imported by name: low 31 bits = RVA of IMAGE_IMPORT_BY_NAME (Hint:u16, Name:char[]).
@@ -431,6 +443,7 @@ fn parse_thunks(
                 name: Some(name),
                 hint_or_ordinal: hint,
                 by_ordinal: false,
+                import_by_name_rva: Some(name_rva),
             });
         }
         if i + 1 == MAX_IMPORTS_PER_DLL {
