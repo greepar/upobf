@@ -28,13 +28,28 @@ use upobf_core::{
 // ---------------------------------------------------------------------------
 
 pub const UPOBF_PAYLOAD_MAGIC: u32 = 0x42504F55; // 'U','P','O','B' little-endian
-pub const UPOBF_PAYLOAD_VERSION: u32 = 1;
+/// Phase I bumped this from 1 to 2: header layout grew by 80 bytes
+/// at the tail (oep_steal_len/oep_target_rva/oep_patch_rva + 32 bytes
+/// of stolen prologue + 4 reserved). Stub keys behaviour off this.
+pub const UPOBF_PAYLOAD_VERSION: u32 = 2;
 pub const UPOBF_FLAG_BCJ_X86: u32 = 1 << 0;
 pub const UPOBF_FLAG_LZMA: u32 = 1 << 1;
 pub const UPOBF_FLAG_CHACHA20: u32 = 1 << 2;
 
-pub const PAYLOAD_HEADER_SIZE: usize = 84;
+/// V1 header size kept as a comment landmark: 10 * 4 + 32 + 12 = 84.
+/// V2 adds: 4 * u32 + UPOBF_OEP_STEAL_MAX = 16 + 64 = 80 bytes
+/// after master_nonce. Total: 84 + 80 = 164 bytes.
+pub const PAYLOAD_HEADER_SIZE: usize = 164;
 pub const CHUNK_ENTRY_SIZE: usize = 40;
+
+/// Maximum bytes the on-wire `oep_stolen_bytes` slot can hold —
+/// the *encoded* trampoline body (PI verbatim + rewritten rel-
+/// branches). Mirrors `UPOBF_OEP_STEAL_MAX` in the stub.
+pub const OEP_STEAL_MAX: usize = 64;
+
+/// Number of bytes the stub patches into the host's OEP. Mirrors
+/// `UPOBF_OEP_PATCH_GADGET_LEN`. Stub-side fixed.
+pub const OEP_PATCH_GADGET_LEN: usize = 14;
 
 /// Hard cap, mirrors `UPOBF_MAX_CHUNK_COUNT` in the stub.
 pub const MAX_CHUNK_COUNT: usize = 64;
@@ -136,14 +151,67 @@ pub struct BuiltPayload {
     pub master_nonce: Nonce,
 }
 
+/// Phase I: optional OEP-stealing trampoline arguments.
+///   * `encoded` is the trampoline body (PI bytes verbatim and
+///     rewritten rel-branches). Length must lie in
+///     `OEP_PATCH_GADGET_LEN..=OEP_STEAL_MAX`.
+///   * `steal_len` is the number of *original* bytes the packer
+///     overwrote at the host's OEP with `0xCC` int3 fillers — also
+///     the bytes the stub patches over with its 14-byte abs-jmp
+///     gadget. Must lie in `OEP_PATCH_GADGET_LEN..=encoded.len()`.
+///   * `target_rva` is the RVA at which the host's prologue
+///     starts; the trampoline jumps back to
+///     `target_rva + steal_len` after running.
+///   * `patch_rva` is the RVA where the stub writes the abs-jmp
+///     gadget (typically equal to `target_rva`).
+///
+/// Pass `None` to keep the V2 header valid but with
+/// `oep_steal_len = 0`, signalling the stub to skip the redirect.
+#[derive(Debug, Clone)]
+pub struct OepStealArgs {
+    pub encoded: Vec<u8>,
+    pub steal_len: u32,
+    pub target_rva: u32,
+    pub patch_rva: u32,
+}
+
 /// Build a payload blob.
 pub fn build_payload(inputs: &[PayloadInput], poly: &Polymorphic) -> Result<BuiltPayload> {
+    build_payload_v2(inputs, poly, None)
+}
+
+/// V2 builder accepting an optional OEP-stealing descriptor. The V1
+/// `build_payload` shim defaults the OEP arg to `None` so existing
+/// call sites keep compiling.
+pub fn build_payload_v2(
+    inputs: &[PayloadInput],
+    poly: &Polymorphic,
+    oep: Option<OepStealArgs>,
+) -> Result<BuiltPayload> {
     if inputs.len() > MAX_CHUNK_COUNT {
         anyhow::bail!(
             "too many input chunks ({}); MAX_CHUNK_COUNT={}",
             inputs.len(),
             MAX_CHUNK_COUNT
         );
+    }
+
+    if let Some(o) = &oep {
+        if o.encoded.len() < OEP_PATCH_GADGET_LEN || o.encoded.len() > OEP_STEAL_MAX {
+            anyhow::bail!(
+                "OEP encoded trampoline length {} out of range [{}..={}]",
+                o.encoded.len(),
+                OEP_PATCH_GADGET_LEN,
+                OEP_STEAL_MAX
+            );
+        }
+        if (o.steal_len as usize) < OEP_PATCH_GADGET_LEN {
+            anyhow::bail!(
+                "OEP steal_len {} below gadget length {}",
+                o.steal_len,
+                OEP_PATCH_GADGET_LEN
+            );
+        }
     }
 
     let master_key = poly.derive_key("payload.master.key");
@@ -237,6 +305,25 @@ pub fn build_payload(inputs: &[PayloadInput], poly: &Polymorphic) -> Result<Buil
     let total_size: usize = data_offset as usize + data_size as usize;
     let mut out = vec![0u8; total_size];
 
+    // Pack OEP-stealing fields. `oep_steal_len = 0` means feature
+    // disabled. The stolen-bytes slot is always zero-padded to
+    // OEP_STEAL_MAX so a static analyser cannot read header layout
+    // off the high-water mark.
+    let (oep_steal_len, oep_encoded_len, oep_target_rva, oep_patch_rva, oep_bytes) = match oep {
+        Some(o) => {
+            let mut buf = [0u8; OEP_STEAL_MAX];
+            buf[..o.encoded.len()].copy_from_slice(&o.encoded);
+            (
+                o.steal_len,
+                o.encoded.len() as u32,
+                o.target_rva,
+                o.patch_rva,
+                buf,
+            )
+        }
+        None => (0u32, 0u32, 0u32, 0u32, [0u8; OEP_STEAL_MAX]),
+    };
+
     // PayloadHeader
     write_payload_header(
         &mut out[0..PAYLOAD_HEADER_SIZE],
@@ -253,6 +340,11 @@ pub fn build_payload(inputs: &[PayloadInput], poly: &Polymorphic) -> Result<Buil
             flags: 0,
             master_key,
             master_nonce,
+            oep_steal_len,
+            oep_encoded_len,
+            oep_target_rva,
+            oep_patch_rva,
+            oep_stolen_bytes: oep_bytes,
         },
     );
 
@@ -318,6 +410,11 @@ struct Header {
     flags: u32,
     master_key: [u8; 32],
     master_nonce: [u8; 12],
+    oep_steal_len: u32,
+    oep_encoded_len: u32,
+    oep_target_rva: u32,
+    oep_patch_rva: u32,
+    oep_stolen_bytes: [u8; OEP_STEAL_MAX],
 }
 
 fn write_payload_header(buf: &mut [u8], h: Header) {
@@ -334,6 +431,12 @@ fn write_payload_header(buf: &mut [u8], h: Header) {
     LittleEndian::write_u32(&mut buf[36..40], h.flags);
     buf[40..72].copy_from_slice(&h.master_key);
     buf[72..84].copy_from_slice(&h.master_nonce);
+    // V2 tail (Phase I)
+    LittleEndian::write_u32(&mut buf[84..88], h.oep_steal_len);
+    LittleEndian::write_u32(&mut buf[88..92], h.oep_encoded_len);
+    LittleEndian::write_u32(&mut buf[92..96], h.oep_target_rva);
+    LittleEndian::write_u32(&mut buf[96..100], h.oep_patch_rva);
+    buf[100..100 + OEP_STEAL_MAX].copy_from_slice(&h.oep_stolen_bytes);
 }
 
 struct ChunkRow {
@@ -420,8 +523,10 @@ mod tests {
 
     #[test]
     fn header_layout_size_matches_protocol() {
-        // Field-list arithmetic per docs/protocol-m4.md.
-        assert_eq!(PAYLOAD_HEADER_SIZE, 10 * 4 + 32 + 12);
+        // V1 prefix: 10*4 + 32 + 12 = 84.
+        // V2 tail:    4*4 + OEP_STEAL_MAX = 16 + 64 = 80.
+        // Total header: 164.
+        assert_eq!(PAYLOAD_HEADER_SIZE, 10 * 4 + 32 + 12 + 4 * 4 + OEP_STEAL_MAX);
         assert_eq!(CHUNK_ENTRY_SIZE, 7 * 4 + 12);
     }
 

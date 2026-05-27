@@ -30,7 +30,14 @@ extern "C" {
 //
 // Bytes 'U','P','O','B' read as a little-endian u32 = 0x42_4F_50_55.
 #define UPOBF_PAYLOAD_MAGIC   ((uint32_t)0x42504F55u)
-#define UPOBF_PAYLOAD_VERSION ((uint32_t)1u)
+// Phase I bumped this from 1 to 2: the header layout grew by 80 bytes
+// at the tail (oep_steal_len/oep_target_rva/oep_patch_rva + 64 bytes
+// of stolen prologue + 8 reserved bytes). Older stubs reading a V2
+// header would still see a valid magic and process chunks correctly,
+// but they'd skip the OEP redirect — fail-safe enough that we don't
+// require a hard mismatch error there, but the version field is the
+// canonical place to gate new behaviour.
+#define UPOBF_PAYLOAD_VERSION ((uint32_t)2u)
 
 // ---------------------------------------------------------------------
 // ChunkEntry.flags bits
@@ -110,6 +117,28 @@ static inline void upobf_fixed_api_nonce_get(uint8_t out[12]) {
 }
 
 // ---------------------------------------------------------------------
+// Phase I OEP-stealing constants
+// ---------------------------------------------------------------------
+//
+// Maximum number of *encoded* trampoline bytes we ever store. The
+// on-wire `PayloadHeader.oep_stolen_bytes` slot is sized to this
+// constant; values > 64 are treated as "feature disabled" by the
+// stub.
+//
+// Must match `OEP_STEAL_MAX` in `crates/upobf-pe/src/layout/oep_steal.rs`.
+#define UPOBF_OEP_STEAL_MAX 64u
+
+// Length of the absolute jump gadget the stub patches into the
+// host's original OEP. Must match `OEP_PATCH_GADGET_LEN` on the
+// packer side.
+//
+//   FF 25 00 00 00 00       jmp qword ptr [rip+0]   (6 bytes)
+//   <8 bytes absolute VA>                            (8 bytes)
+//
+// = 14 bytes. The stolen prologue is always at least this long.
+#define UPOBF_OEP_PATCH_GADGET_LEN 14u
+
+// ---------------------------------------------------------------------
 // Structs
 // ---------------------------------------------------------------------
 
@@ -128,6 +157,39 @@ typedef struct PayloadHeader {
     uint32_t flags;             // reserved (0)
     uint8_t  master_key[32];    // ChaCha20 256-bit master key
     uint8_t  master_nonce[12];  // ChaCha20 96-bit master nonce
+
+    // ----- Phase I extension (V2) -----------------------------------
+    //
+    // OEP-stealing prologue. The stub redirects the original entry
+    // point through a heap trampoline so a memory dump captures
+    // `jmp <heap-VA>` at the OEP, which crashes when re-run from a
+    // dumped PE on a fresh process.
+    //
+    //   oep_steal_len    : ORIGINAL bytes the packer overwrote with
+    //                      0xCC int3 (= bytes the stub will patch
+    //                      back with its 14-byte abs-jmp gadget).
+    //                      0 disables the feature.
+    //   oep_encoded_len  : LENGTH of `oep_stolen_bytes`, the
+    //                      trampoline body. May exceed steal_len
+    //                      because rel-call/jmp are rewritten to
+    //                      absolute indirect form (16/14 bytes vs.
+    //                      5/2 source bytes).
+    //   oep_target_rva   : RVA at which the host's prologue starts.
+    //                      The trampoline jumps back to
+    //                      `target_rva + steal_len` after running.
+    //   oep_patch_rva    : RVA where the stub writes the 14-byte
+    //                      abs-jmp gadget. Same as `target_rva` for
+    //                      basic OEP redirect.
+    //   oep_stolen_bytes : the trampoline body, padded with 0xCC up
+    //                      to UPOBF_OEP_STEAL_MAX (64). Stub copies
+    //                      the leading `oep_encoded_len` bytes
+    //                      verbatim, then appends a 14-byte
+    //                      `jmp [rip+0]; .quad target_rva + steal_len`.
+    uint32_t oep_steal_len;
+    uint32_t oep_encoded_len;
+    uint32_t oep_target_rva;
+    uint32_t oep_patch_rva;
+    uint8_t  oep_stolen_bytes[UPOBF_OEP_STEAL_MAX];
 } PayloadHeader;
 
 typedef struct ChunkEntry {

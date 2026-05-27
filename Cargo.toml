@@ -50,6 +50,9 @@ rand_chacha = "0.3"
 # Bytes
 byteorder = "1.5"
 
+# x86-64 length disassembly (Phase I OEP-stealing analyzer)
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

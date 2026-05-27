@@ -21,6 +21,7 @@
 - [x] **Phase E** `.rdata` 分块压缩（forbidden-page mask + section splitting；demo 进一步从 27.86 MiB 砍到 18.39 MiB / 41.0%）
 - [x] **Phase F** 后台 CRC32 watchdog 线程（每 30 s 重算 chunk 基线；不退出，mismatch 异或进 heap 内 seed；packed.exe 线程数 +1）
 - [x] **Phase H** `upobf-cff` 控制流扁平化（DemoteRegToStack + dispatcher loop with PRNG-scrambled state IDs；entry/anti_debug/api_resolve/watchdog 走 cff，chacha20/bcj_x86/lzma_dec 豁免）
+- [x] **Phase I** OEP redirect + stolen bytes（iced-x86 LDE 解码 OEP prologue；PI 字节直拷、`call/jmp rel32` 重写为 abs 间接形式；packer 把原 prologue 替换成 `0xCC` 后再压缩；stub 解压完 VirtualAlloc 一页 trampoline + 14B abs-jmp 回 host，再把原 OEP 处int3 padding 写回成 `jmp [rip+0]; .quad <heap-VA>`；ProcessHacker dump 出来的 PE OEP 处指向堆 VA，重跑必崩）
 - [ ] **V2** Linux ELF + macOS Mach-O
 
 ## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）

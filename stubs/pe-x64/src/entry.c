@@ -129,6 +129,11 @@ int upobf_lzma_decompress_alone(
 uint32_t upobf_env_seed(const ResolvedApis *apis);
 uint32_t upobf_crc32(const uint8_t* data, uint32_t len, uint32_t init);
 
+// Phase I OEP-stealing redirect.
+int upobf_oep_redirect_install(const PayloadHeader *ph,
+                               uint8_t              *image_base,
+                               const ResolvedApis   *apis);
+
 // ---------------------------------------------------------------------
 // Tiny freestanding helpers (no libc).
 // ---------------------------------------------------------------------
@@ -326,10 +331,16 @@ void upobf_stub_tls_callback(HINSTANCE h, DWORD reason, LPVOID reserved)
         (const ChunkEntry*)((const uint8_t*)ph + ph->chunks_offset);
     volatile uint32_t integrity = env_seed;
 
-    // Collect a per-chunk CRC baseline as we go. The watchdog uses it
-    // later to detect post-unpack tampering of the host image. Sized
-    // to UPOBF_WATCHDOG_MAX_REGIONS == UPOBF_MAX_CHUNK_COUNT == 64;
+    // Collect a per-chunk CRC baseline. The watchdog uses it later to
+    // detect post-unpack tampering of the host image. Sized to
+    // UPOBF_WATCHDOG_MAX_REGIONS == UPOBF_MAX_CHUNK_COUNT == 64;
     // we cap defensively in case the protocol ever grows beyond that.
+    //
+    // Phase I ordering: decode first, install the OEP-stealing
+    // redirect (which mutates the .text bytes back over the int3
+    // padding), THEN take the baseline. This way the watchdog's
+    // expected CRC reflects the post-redirect bytes that will
+    // actually be on disk in steady state.
     WatchdogRegion baselines[UPOBF_WATCHDOG_MAX_REGIONS];
     uint32_t baseline_count = 0;
 
@@ -337,6 +348,21 @@ void upobf_stub_tls_callback(HINSTANCE h, DWORD reason, LPVOID reserved)
         if (!process_chunk(ph, &chunks[i], image_base, &apis)) {
             // Keep going — partial unpack is less suspicious than hard fail.
         }
+    }
+
+    // Phase I: install OEP-stealing redirect. Must run AFTER all
+    // chunks are decoded (so the host's int3-padded OEP is in
+    // place to overwrite) and BEFORE we collect watchdog baselines
+    // (so the baseline CRC matches the post-redirect bytes).
+    // Failure is silent: a failed install means the host hits
+    // int3s at OEP and crashes, which is the desired
+    // tamper-evident behaviour for a partial unpack. A successful
+    // install rewrites the int3 padding back into a valid
+    // abs-jmp gadget.
+    (void)upobf_oep_redirect_install(ph, image_base, &apis);
+
+    // Now snapshot CRCs over the final, redirect-installed bytes.
+    for (uint32_t i = 0; i < ph->chunk_count; i++) {
         const ChunkEntry* ce = &chunks[i];
         const uint8_t* dst = image_base + ce->target_rva;
         uint32_t chunk_crc = upobf_crc32(dst, ce->virtual_size, 0);

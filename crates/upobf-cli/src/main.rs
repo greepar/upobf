@@ -264,8 +264,9 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
     use upobf_core::crypto::prng::Polymorphic;
     use upobf_core::obfuscate::section_names;
     use upobf_core::obfuscate::stub_polymorph;
-    use upobf_pe::build::payload::{build_payload, PayloadInput};
+    use upobf_pe::build::payload::{build_payload_v2, OepStealArgs, PayloadInput};
     use upobf_pe::build::writer::{section_protect_for_chars, PackedPeBuilder};
+    use upobf_pe::layout::oep_steal::{analyze_oep_prologue, OEP_PATCH_GADGET_LEN};
 
     let image = upobf_pe::PeImage::from_file(&input)
         .with_context(|| format!("failed to parse {}", input.display()))?;
@@ -341,6 +342,14 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
     // the payload as its own chunk. Forbidden ranges (Import / IAT /
     // LoadConfig / TLS / Resource / Exception / Reloc / Debug / etc.)
     // stay verbatim in the packed image at their original RVAs.
+    // Phase I: analyse the host's OEP prologue *before* we copy
+    // `.text` into the payload, so the stolen-bytes replacement
+    // (real prologue -> 0xCC int3 padding) propagates through the
+    // chunk that gets encrypted and compressed. The analyzer
+    // returns up to OEP_STEAL_MAX bytes; we then patch them in
+    // place inside our owned `data` buffer.
+    let mut oep_args: Option<OepStealArgs> = None;
+
     let mut inputs: Vec<PayloadInput> = Vec::new();
     let mut compressed_ranges: Vec<(u32, u32)> = Vec::new();
 
@@ -357,7 +366,69 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
                 if pack_len == 0 {
                     continue;
                 }
-                let data = image.raw[raw_off..raw_off + pack_len].to_vec();
+                let mut data = image.raw[raw_off..raw_off + pack_len].to_vec();
+
+                // Try OEP-stealing if the entry point lies inside
+                // this `.text`. NativeAOT and standard MSVC
+                // toolchains both keep AddressOfEntryPoint in
+                // `.text`; for hosts that point AoEP elsewhere
+                // (rare; small custom DOS-style hosts), we silently
+                // skip Phase I and the packed binary still runs —
+                // it just lacks the dump-resistance benefit.
+                let oep_rva = image.nt.optional_header.address_of_entry_point;
+                let sec_start = sec.virtual_address;
+                let sec_end = sec_start + pack_len as u32;
+                if oep_args.is_none()
+                    && oep_rva >= sec_start
+                    && oep_rva < sec_end
+                {
+                    let oep_off_in_sec = (oep_rva - sec_start) as usize;
+                    let candidate = &data[oep_off_in_sec..];
+                    match analyze_oep_prologue(
+                        candidate,
+                        oep_rva,
+                        image.nt.optional_header.image_base,
+                    ) {
+                        Ok(stolen) => {
+                            // Sanity: never overwrite past the
+                            // section bytes we own.
+                            if oep_off_in_sec + stolen.steal_len <= data.len() {
+                                tracing::info!(
+                                    oep_rva = format!("{:#x}", oep_rva),
+                                    steal_len = stolen.steal_len,
+                                    encoded_len = stolen.encoded.len(),
+                                    "Phase I: stealing OEP prologue",
+                                );
+                                // Replace the stolen prologue with
+                                // 0xCC int3 fillers in the chunk
+                                // we'll compress + encrypt. The
+                                // OEP page therefore arrives at
+                                // run time as int3 padding; the
+                                // stub writes the real abs-jmp
+                                // gadget over it.
+                                for b in &mut data
+                                    [oep_off_in_sec..oep_off_in_sec + stolen.steal_len]
+                                {
+                                    *b = 0xCC;
+                                }
+                                oep_args = Some(OepStealArgs {
+                                    encoded: stolen.encoded,
+                                    steal_len: stolen.steal_len as u32,
+                                    target_rva: oep_rva,
+                                    patch_rva: oep_rva,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::info!(
+                                error = %e,
+                                "Phase I: OEP analyser declined; running without redirect"
+                            );
+                        }
+                    }
+                    let _ = OEP_PATCH_GADGET_LEN; // silence unused
+                }
+
                 inputs.push(PayloadInput {
                     target_rva: sec.virtual_address,
                     virtual_size: pack_len as u32,
@@ -419,7 +490,7 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
         }
     }
 
-    let payload = build_payload(&inputs, &poly).context("build payload")?;
+    let payload = build_payload_v2(&inputs, &poly, oep_args).context("build payload")?;
 
     // ---- Assemble packed PE --------------------------------------------
     let mut builder = PackedPeBuilder::new(&image, linked, payload.bytes);

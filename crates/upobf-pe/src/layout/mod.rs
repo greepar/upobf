@@ -2,5 +2,6 @@
 
 pub mod classifier;
 pub mod name_polymorph;
+pub mod oep_steal;
 pub mod rich_header;
 pub mod safe_ranges;
