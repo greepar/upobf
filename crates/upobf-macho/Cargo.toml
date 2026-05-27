@@ -1,0 +1,11 @@
+[package]
+name = "upobf-macho"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "macOS Mach-O (arm64) support for upobf (placeholder for V2)."
+
+[dependencies]
+upobf-core.workspace = true
+anyhow.workspace = true

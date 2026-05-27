@@ -1,0 +1,20 @@
+[package]
+name = "upobf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cross-platform core for upobf packer/obfuscator (compression, crypto, filters, obfuscation passes)."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+chacha20.workspace = true
+sha2.workspace = true
+crc32fast.workspace = true
+xz2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+byteorder.workspace = true

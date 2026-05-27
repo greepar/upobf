@@ -1,0 +1,130 @@
+# upobf
+
+> **u**niversal **p**acker + **ob**fuscator **f**ramework
+> 类似 UPX 的压缩壳，配合反调试 / 完整性校验 / 多态化。
+> 开源、AV 友好、为大体积 .NET NativeAOT / Avalonia 桌面程序优化。
+
+## 状态
+
+- [x] **M0** workspace 骨架（5 crates，Rust workspace）
+- [x] **M1** PE32+ 解析（手写、零 unsafe、12 个单元测试 + 2 个 demo 集成测试）
+- [x] **M2** LZMA + ChaCha20 + BCJ-x86 filter（17 个集成测试，含 RFC 8439 KAT）
+- [x] **M3** Stub 骨架（C + asm，clang freestanding，COFF parser + multi-obj linker，5 个测试）
+- [x] **M4** 完整压缩管线 → packed.exe 启动后 NativeAOT + Avalonia UI 正常工作
+- [x] **M5** AV 友好反调试 + 内联 CRC32 完整性 + per-build 多态
+- [x] **M6** E2E 测试脚本（`tests/e2e/pack_run_verify.ps1`），全程自动化验证
+- [ ] **V2** 节名 / Rich header 多态、CFF / BCF 控制流混淆、Linux ELF + macOS Mach-O
+
+## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）
+
+| 指标 | 值 |
+|---|---|
+| 原大小 | 44.85 MB |
+| Packed 大小 | 26.57 MB |
+| 压缩率 | **62.1%（节省 38%）** |
+| Pack 耗时 (release) | ~8.5 s |
+| Packed 启动到首屏 | ~2-3 s |
+| Packed 运行时内存 | ~120 MB（与原版一致） |
+| Per-build SHA256 差异 | ✅（master_key/master_nonce 由 OsRng 派生） |
+
+## 工程布局
+
+```
+crates/
+  upobf-core   跨平台核心：compress / crypto / filter / obfuscate / policy / stub_link
+  upobf-pe     Windows PE 实现：parse / layout / build
+  upobf-elf    V2 占位 (Linux ELF)
+  upobf-macho  V2 占位 (macOS Mach-O)
+  upobf-cli    `upobf pack` / `upobf inspect`
+
+stubs/pe-x64/  C + asm，clang 编译的 freestanding stub
+  src/
+    entry.c        TLS callback 入口、解密+解压主循环
+    chacha20.c     ChaCha20 流密码
+    lzma_dec.c     公版 LZMA SDK alone-format 解压器（vendored）
+    bcj_x86.c      BCJ x86 inverse filter
+    anti_debug.c   IsDebuggerPresent + GetThreadContext + CRC32
+  build.ps1      用 clang -ffreestanding -nostdlib 编译
+
+tests/
+  e2e/pack_run_verify.ps1   端到端：build → pack → run → 多态校验
+```
+
+## 构建
+
+```pwsh
+cargo build --workspace            # builder + libs
+.\stubs\pe-x64\build.ps1           # stub COFF objects
+cargo test  --workspace            # 37 tests
+```
+
+## 使用
+
+> `demo/PatchInstaller.exe` 是 42 MB 的 NativeAOT + Avalonia 测试样本，**未入 git**
+> （见 `.gitignore`）。运行 inspect / pack / E2E 前请把它放到 `demo/` 目录。
+
+```pwsh
+# 解析 PE，输出文本 / JSON 报告
+upobf inspect demo\PatchInstaller.exe
+upobf inspect demo\PatchInstaller.exe --json
+
+# 加壳
+upobf pack demo\PatchInstaller.exe -o packed.exe
+
+# 端到端 verify
+.\tests\e2e\pack_run_verify.ps1
+```
+
+## 关键设计决策（M4 核心创新）
+
+### 不重写 TLS Directory，改为 in-place 注入
+
+直接重建 `IMAGE_TLS_DIRECTORY` 会破坏 NativeAOT 启动（运行时依赖原 callback 数组的 alignment 与 slot 布局）。
+正确做法：保留原 DataDirectory[9] 完全不动，**在原 callback 数组所在 `.rdata` 字节处** patch 为
+`[stub_va, original_va, NULL]`。新增的 `stub_va` 通过 `.reloc2` 加入基址重定位列表。
+
+### 复用 host 的 IAT，不新增 Import 描述符
+
+NativeAOT 二进制已经导入 `KERNEL32!{VirtualAlloc, VirtualProtect, VirtualFree, GetProcAddress, LoadLibraryA,
+IsDebuggerPresent, GetThreadContext, GetCurrentProcess, GetCurrentThread}`。stub 复用这些 IAT slot 而不是
+新增 `.idata2` 描述符 —— 避免重写 DataDirectory[Import] 时 OS Loader 拒绝加载。
+
+### 不可压缩段保留原 RVA
+
+绝对**不**压缩 `.pdata`（x64 SEH unwinder 必读）、`.rsrc`（manifest / icon / DPI）、`.reloc`（OS Loader 必读）、
+`.data`（含 LoadConfig.SecurityCookie，OS Loader 在 stub 之前写入）。M4 仅压缩 `.text`。M5/V2 将分块压缩
+`.rdata` 和 `.data` 的冷区。
+
+### AV 友好反调试
+
+仅使用公开 Windows API（`IsDebuggerPresent` / `GetThreadContext`）。
+**发现调试时不退出**，而是把检测结果累积到 `env_seed`，让 RE 误以为没起效。
+不做：自调试、远程线程、direct syscall、API hashing 全清空 IAT、reflective loader。
+
+## 测试矩阵
+
+```
+cargo test --workspace        # 37 tests, all green
+.\tests\e2e\pack_run_verify.ps1
+```
+
+E2E 检验：
+1. Stub 编译产出 7 个 .obj（~17 KB 总）
+2. 加壳产出 packed.exe，比例 ≤ 70%
+3. packed.exe 运行 ≥ 5s，标题非空，线程数 > 1
+4. 两次连续打包 SHA256 不同（多态校验）
+
+## 下一步（V2）
+
+- [ ] 节名多态化（用 `polymorphic.derive("section.{i}")` 派生伪 MSVC 风格名）
+- [ ] Rich Header 伪造
+- [ ] 控制流混淆 stub（自研 LLVM 17+ pass，CFF/BCF/InstSub）
+- [ ] 后台 CRC watchdog 线程
+- [ ] `.rdata` / `.data` 分块压缩（避开 LoadConfig / IAT / 静态字段）
+- [ ] Linux x64 (ELF) 支持
+- [ ] macOS arm64 (Mach-O) 支持
+
+## 文档
+
+- [docs/protocol-m4.md](docs/protocol-m4.md) — packer ↔ stub 二进制协议（PayloadHeader / ChunkEntry / ApiTable）
+- 设计文档（plan）：`~/.local/share/opencode/plans/upobf-design-plan.md`

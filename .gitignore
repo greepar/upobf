@@ -1,0 +1,37 @@
+# Build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Stub build outputs
+/stubs/**/build/
+/stubs/**/*.obj
+/stubs/**/*.o
+/stubs/**/*.blob
+/stubs/**/*.lib
+/stubs/**/*.exp
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test outputs
+/tests/output/
+*.packed.exe
+/packed*.exe
+/demo/packed*.exe
+# Stray scratch artefacts left from manual experiments
+/__t.exe
+/copy.exe
+/inspect.json
+
+# Demo test sample (NativeAOT + Avalonia binary, 42 MB).
+# Provided externally; place under demo/ before running tests.
+/demo/*.exe
