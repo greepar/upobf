@@ -468,10 +468,52 @@ fn cmd_inspect_pe(input: PathBuf, json: bool) -> Result<()> {
 fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {
     match detect_format(&input)? {
         Format::Pe => cmd_pack_pe(input, output, _no_compress, _no_encrypt),
-        Format::Elf => bail!(
-            "ELF packing not yet implemented (M1L pending); inspect mode works"
-        ),
+        Format::Elf => cmd_pack_elf(input, output, _no_compress, _no_encrypt),
     }
+}
+
+fn cmd_pack_elf(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {
+    // M1L baseline: passthrough writer with optional stub +
+    // init_array injection. M3L will wire in the real stub blob and
+    // payload; for now the writer is exercised in the simplest mode.
+    use upobf_elf::build::PackedElfBuilder;
+
+    let image = upobf_elf::ElfImage::from_file(&input)
+        .with_context(|| format!("failed to parse {}", input.display()))?;
+
+    tracing::info!(
+        path = %input.display(),
+        is_pie = image.is_pie(),
+        phdrs = image.phdrs.len(),
+        shdrs = image.shdrs.len(),
+        "ELF M1L passthrough pack"
+    );
+
+    let bytes = PackedElfBuilder::new(&image)
+        .build()
+        .context("build packed ELF (passthrough)")?;
+
+    std::fs::write(&output, &bytes)
+        .with_context(|| format!("write {}", output.display()))?;
+
+    // Make output executable (preserve original mode + ensure +x).
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(&output)?.permissions();
+    perm.set_mode(perm.mode() | 0o755);
+    std::fs::set_permissions(&output, perm)?;
+
+    let orig = std::fs::metadata(&input)?.len();
+    let pkt = std::fs::metadata(&output)?.len();
+    println!(
+        "packed: {} -> {} ({} -> {} bytes, +{} bytes / +{:.2}%)",
+        input.display(),
+        output.display(),
+        orig,
+        pkt,
+        pkt - orig,
+        ((pkt as f64 - orig as f64) / orig as f64) * 100.0,
+    );
+    Ok(())
 }
 
 fn cmd_pack_pe(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {

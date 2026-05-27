@@ -3,6 +3,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]
 
+pub mod build;
+pub mod layout;
 pub mod parse;
 
 pub use parse::ElfImage;
