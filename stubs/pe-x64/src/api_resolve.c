@@ -225,6 +225,9 @@ int upobf_resolve_apis(const PayloadHeader   *ph,
         out->GetCurrentProcess = (PFN_GetCurrentProcess)slots[UPOBF_API_GET_CURRENT_PROCESS];
         out->GetCurrentThread  = (PFN_GetCurrentThread) slots[UPOBF_API_GET_CURRENT_THREAD];
         out->GetThreadContext  = (PFN_GetThreadContext) slots[UPOBF_API_GET_THREAD_CONTEXT];
+        out->CreateThread      = (PFN_CreateThread)     slots[UPOBF_API_CREATE_THREAD];
+        out->Sleep             = (PFN_Sleep)            slots[UPOBF_API_SLEEP];
+        out->CloseHandle       = (PFN_CloseHandle)      slots[UPOBF_API_CLOSE_HANDLE];
 
         ok = 1;
     } while (0);

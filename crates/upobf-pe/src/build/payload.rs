@@ -45,11 +45,10 @@ pub const MAX_API_TABLE_SIZE: usize = 4096;
 pub const FIXED_API_NONCE: [u8; 12] = *b"upobf:apinon";
 
 /// Number of API entries in the protocol table (must match
-/// `UPOBF_API_COUNT`). Phase G expanded this from 6 to 9: every API
-/// the stub uses goes through the (encrypted) string table and is
-/// resolved via GetProcAddress at runtime. Only two anchors remain
-/// in the import table, slot 0 and slot 1.
-pub const API_COUNT: usize = 9;
+/// `UPOBF_API_COUNT`). Phase G expanded this from 6 to 9; Phase F
+/// adds three more (CreateThread / Sleep / CloseHandle) for the
+/// background CRC watchdog thread.
+pub const API_COUNT: usize = 12;
 
 /// Indices into the API table. The order is part of the protocol —
 /// stub-side `enum` in `api_resolve.h` mirrors it 1:1.
@@ -62,6 +61,9 @@ pub const IDX_IS_DEBUGGER_PRESENT: usize = 5;
 pub const IDX_GET_CURRENT_PROCESS: usize = 6;
 pub const IDX_GET_CURRENT_THREAD: usize = 7;
 pub const IDX_GET_THREAD_CONTEXT: usize = 8;
+pub const IDX_CREATE_THREAD: usize = 9;
+pub const IDX_SLEEP: usize = 10;
+pub const IDX_CLOSE_HANDLE: usize = 11;
 
 /// Fixed name list driving the API string table. The stub indexes by
 /// position so this order is part of the protocol. Slots 0 and 1 are
@@ -70,10 +72,10 @@ pub const IDX_GET_THREAD_CONTEXT: usize = 8;
 /// inside the stub at runtime.
 ///
 /// We pick the wide-character `GetModuleHandleW` over the ASCII form
-/// because the demo NativeAOT corpus (and most modern Windows
-/// binaries) imports it but not `GetModuleHandleA`. Sticking with
+/// because modern .NET NativeAOT binaries — the primary upobf target —
+/// already import the W variant but not the A variant. Sticking with
 /// what the host already pulls in lets us avoid rewriting
-/// DataDirectory[Import], which destabilises NativeAOT bootstrap.
+/// DataDirectory[Import].
 pub const API_NAMES: [(&str, &str); API_COUNT] = [
     ("KERNEL32.dll", "GetModuleHandleW"), // 0 anchor
     ("KERNEL32.dll", "GetProcAddress"),   // 1 anchor
@@ -84,6 +86,9 @@ pub const API_NAMES: [(&str, &str); API_COUNT] = [
     ("KERNEL32.dll", "GetCurrentProcess"),// 6 dynamic
     ("KERNEL32.dll", "GetCurrentThread"), // 7 dynamic
     ("KERNEL32.dll", "GetThreadContext"), // 8 dynamic
+    ("KERNEL32.dll", "CreateThread"),     // 9 watchdog
+    ("KERNEL32.dll", "Sleep"),            // 10 watchdog
+    ("KERNEL32.dll", "CloseHandle"),      // 11 watchdog
 ];
 
 /// Number of leading entries in [`API_NAMES`] that are anchors. Anchor

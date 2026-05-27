@@ -76,6 +76,18 @@ typedef UPOBF_HANDLE  (UPOBF_WINAPI *PFN_GetCurrentProcess)(void);
 typedef UPOBF_HANDLE  (UPOBF_WINAPI *PFN_GetCurrentThread)(void);
 typedef UPOBF_BOOL    (UPOBF_WINAPI *PFN_GetThreadContext)(UPOBF_HANDLE, void*);
 
+// Phase F watchdog APIs.
+typedef UPOBF_DWORD   (UPOBF_WINAPI *PFN_ThreadStart)(UPOBF_LPVOID);
+typedef UPOBF_HANDLE  (UPOBF_WINAPI *PFN_CreateThread)(
+    UPOBF_LPVOID                /* lpThreadAttributes */,
+    UPOBF_SIZE_T                /* dwStackSize        */,
+    PFN_ThreadStart             /* lpStartAddress     */,
+    UPOBF_LPVOID                /* lpParameter        */,
+    UPOBF_DWORD                 /* dwCreationFlags    */,
+    UPOBF_DWORD*                /* lpThreadId         */);
+typedef void          (UPOBF_WINAPI *PFN_Sleep)(UPOBF_DWORD /* dwMilliseconds */);
+typedef UPOBF_BOOL    (UPOBF_WINAPI *PFN_CloseHandle)(UPOBF_HANDLE);
+
 /// Table of resolved function pointers, indexed by `UPOBF_API_*`.
 /// All entries are non-NULL after a successful `upobf_resolve_apis`
 /// call. Entries the resolver couldn't find are left at NULL and the
@@ -90,6 +102,9 @@ typedef struct ResolvedApis {
     PFN_GetCurrentProcess   GetCurrentProcess;    // [6]
     PFN_GetCurrentThread    GetCurrentThread;     // [7]
     PFN_GetThreadContext    GetThreadContext;     // [8]
+    PFN_CreateThread        CreateThread;         // [9]
+    PFN_Sleep               Sleep;                // [10]
+    PFN_CloseHandle         CloseHandle;          // [11]
 } ResolvedApis;
 
 /// Decrypt the API string table sitting at

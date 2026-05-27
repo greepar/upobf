@@ -38,6 +38,7 @@
 #include "payload.h"
 #include "obfuscate.h"
 #include "api_resolve.h"
+#include "watchdog.h"
 
 // ---------------------------------------------------------------------
 // Windows types & API surface (no <windows.h>; we keep this minimal so
@@ -324,20 +325,70 @@ void upobf_stub_tls_callback(HINSTANCE h, DWORD reason, LPVOID reserved)
     const ChunkEntry* chunks =
         (const ChunkEntry*)((const uint8_t*)ph + ph->chunks_offset);
     volatile uint32_t integrity = env_seed;
+
+    // Collect a per-chunk CRC baseline as we go. The watchdog uses it
+    // later to detect post-unpack tampering of the host image. Sized
+    // to UPOBF_WATCHDOG_MAX_REGIONS == UPOBF_MAX_CHUNK_COUNT == 64;
+    // we cap defensively in case the protocol ever grows beyond that.
+    WatchdogRegion baselines[UPOBF_WATCHDOG_MAX_REGIONS];
+    uint32_t baseline_count = 0;
+
     for (uint32_t i = 0; i < ph->chunk_count; i++) {
         if (!process_chunk(ph, &chunks[i], image_base, &apis)) {
             // Keep going — partial unpack is less suspicious than hard fail.
         }
         const ChunkEntry* ce = &chunks[i];
         const uint8_t* dst = image_base + ce->target_rva;
+        uint32_t chunk_crc = upobf_crc32(dst, ce->virtual_size, 0);
         integrity = upobf_crc32(dst, ce->virtual_size, integrity);
         integrity ^= JUNK_DATAFLOW(i);
+
+        if (baseline_count < UPOBF_WATCHDOG_MAX_REGIONS) {
+            baselines[baseline_count].ptr = dst;
+            baselines[baseline_count].len = ce->virtual_size;
+            baselines[baseline_count].baseline_crc = chunk_crc;
+            baseline_count++;
+        }
     }
     *(volatile uint32_t*)&env_seed = integrity;
 
+    // Spawn the background CRC watchdog. The state struct must
+    // outlive this stack frame, so we allocate it from the resolved
+    // VirtualAlloc heap. On failure we silently skip — partial-unpack
+    // policy applies, and the host runs normally without watch.
+    if (apis.VirtualAlloc) {
+        WatchdogState *ws = (WatchdogState *)apis.VirtualAlloc(
+            0, (UPOBF_SIZE_T)sizeof(WatchdogState),
+            UPOBF_MEM_COMMIT | UPOBF_MEM_RESERVE,
+            UPOBF_PAGE_READWRITE);
+        if (ws) {
+            // Note: ws->apis ends up holding a pointer to the
+            // *stack-resident* `apis` after `seed_state`, which we
+            // about to wipe. Re-point it at a heap copy so the
+            // watchdog thread keeps a valid handle table.
+            // We append a copy of `apis` immediately after
+            // WatchdogState in a single VirtualAlloc allocation,
+            // simplest path: use two independent allocations and
+            // wire them together.
+            ResolvedApis *apis_copy = (ResolvedApis *)apis.VirtualAlloc(
+                0, (UPOBF_SIZE_T)sizeof(ResolvedApis),
+                UPOBF_MEM_COMMIT | UPOBF_MEM_RESERVE,
+                UPOBF_PAGE_READWRITE);
+            if (apis_copy) {
+                up_memcpy(apis_copy, &apis, sizeof(apis));
+                upobf_watchdog_seed_state(ws, apis_copy, baselines, baseline_count);
+                (void)upobf_watchdog_start(ws);
+            } else {
+                apis.VirtualFree(ws, 0, UPOBF_MEM_RELEASE);
+            }
+        }
+    }
+
     // Wipe the resolved table from the stack before handing control
-    // to the host. The compiler honours volatile zeroing.
+    // to the host. The compiler honours volatile zeroing. The
+    // watchdog now owns its own heap copy.
     up_secure_zero(&apis, (uint32_t)sizeof(apis));
+    up_secure_zero(baselines, (uint32_t)sizeof(baselines));
 
     call_original_tls(h, reason, reserved);
 }

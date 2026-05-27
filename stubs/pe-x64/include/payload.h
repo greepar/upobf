@@ -48,18 +48,12 @@ extern "C" {
 // ---------------------------------------------------------------------
 // API table indices (fixed order from the protocol).
 //
-// Phase G: 9 entries. The first two are *anchor* APIs that remain in
-// the packed PE's import table (the OS Loader resolves them via the
-// host's existing IAT or via a dedicated extra import descriptor);
-// the rest are looked up at runtime via `GetProcAddress` so their
-// names never appear as static strings outside the encrypted
-// `ApiStringTable`.
-//
-// We pick `GetModuleHandleW` (wide-char) over the ASCII form because
-// modern .NET NativeAOT binaries — the primary upobf target —
-// already import the W variant but not the A variant. Picking the
-// W form lets the packer satisfy the anchor through the host's
-// existing IAT and avoid rewriting DataDirectory[Import].
+// Phase G: 9 entries; the first two are anchor APIs that remain in the
+// packed PE's import table, the rest are looked up at runtime via
+// `GetProcAddress`. Phase F adds three more (CreateThread / Sleep /
+// CloseHandle) for the background CRC watchdog thread, all resolved
+// dynamically. The two anchor APIs are still the only ones whose
+// names appear in IAT-visible memory.
 // ---------------------------------------------------------------------
 enum {
     UPOBF_API_GET_MODULE_HANDLE_W = 0, // anchor (wide)
@@ -71,7 +65,10 @@ enum {
     UPOBF_API_GET_CURRENT_PROCESS = 6,
     UPOBF_API_GET_CURRENT_THREAD  = 7,
     UPOBF_API_GET_THREAD_CONTEXT  = 8,
-    UPOBF_API_COUNT               = 9,
+    UPOBF_API_CREATE_THREAD       = 9,  // watchdog
+    UPOBF_API_SLEEP               = 10, // watchdog
+    UPOBF_API_CLOSE_HANDLE        = 11, // watchdog
+    UPOBF_API_COUNT               = 12,
 };
 
 #define UPOBF_API_ANCHOR_COUNT 2u
