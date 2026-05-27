@@ -5,6 +5,8 @@
 //! - [`crypto`]     ChaCha20 stream cipher and PRNG for polymorphism.
 //! - [`filter`]     Pre-compression transforms (BCJ for x86/x64).
 //! - [`obfuscate`]  String encryption, bin2bin mutation passes.
+//! - [`oep_steal`]  Phase I: x86_64 OEP-stealing prologue analyzer.
+//! - [`payload`]    Wire-format payload builder shared by PE / ELF.
 //! - [`policy`]     Build presets (av-friendly / aggressive).
 //! - [`stub_link`]  Relocates compiled stub blobs into a target image.
 
@@ -15,6 +17,8 @@ pub mod compress;
 pub mod crypto;
 pub mod filter;
 pub mod obfuscate;
+pub mod oep_steal;
+pub mod payload;
 pub mod policy;
 pub mod stub_link;
 

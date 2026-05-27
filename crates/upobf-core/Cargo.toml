@@ -18,3 +18,7 @@ xz2.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 byteorder.workspace = true
+
+# x86-64 length disassembly used by the cross-platform OEP-stealing
+# analyzer (Phase I).
+iced-x86 = { workspace = true }

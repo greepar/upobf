@@ -1,3 +1,11 @@
-//! upobf-elf: Linux ELF (x64) support. Placeholder for V2.
+//! upobf-elf: Linux ELF (x64) parsing, layout planning and packing.
 
-pub fn placeholder() {}
+#![forbid(unsafe_op_in_unsafe_fn)]
+#![warn(missing_debug_implementations)]
+
+pub mod parse;
+
+pub use parse::ElfImage;
+
+#[cfg(test)]
+mod unit_tests;

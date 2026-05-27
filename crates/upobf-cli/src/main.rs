@@ -1,6 +1,6 @@
 //! upobf-cli: command-line entry point.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -13,9 +13,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect a PE file and emit a structured report.
+    /// Inspect a PE/ELF file and emit a structured report.
+    /// The format is auto-detected from the magic bytes.
     Inspect {
-        /// Path to PE input.
+        /// Path to PE / ELF input.
         input: PathBuf,
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
@@ -35,6 +36,32 @@ enum Command {
         #[arg(long)]
         no_encrypt: bool,
     },
+}
+
+/// Detected input format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Pe,
+    Elf,
+}
+
+fn detect_format(path: &std::path::Path) -> Result<Format> {
+    let mut buf = [0u8; 16];
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    use std::io::Read;
+    let n = f.read(&mut buf)
+        .with_context(|| format!("read {}", path.display()))?;
+    if n >= 4 && buf[..4] == [0x7F, b'E', b'L', b'F'] {
+        return Ok(Format::Elf);
+    }
+    if n >= 2 && buf[..2] == [b'M', b'Z'] {
+        return Ok(Format::Pe);
+    }
+    bail!(
+        "unrecognised file magic: {:02X} {:02X} {:02X} {:02X}",
+        buf[0], buf[1], buf[2], buf[3]
+    )
 }
 
 fn main() -> Result<()> {
@@ -59,6 +86,185 @@ fn main() -> Result<()> {
 }
 
 fn cmd_inspect(input: PathBuf, json: bool) -> Result<()> {
+    match detect_format(&input)? {
+        Format::Pe => cmd_inspect_pe(input, json),
+        Format::Elf => cmd_inspect_elf(input, json),
+    }
+}
+
+fn cmd_inspect_elf(input: PathBuf, json: bool) -> Result<()> {
+    let image = upobf_elf::ElfImage::from_file(&input)
+        .with_context(|| format!("failed to parse {}", input.display()))?;
+
+    if json {
+        println!("{}", image.to_json_report()?);
+        return Ok(());
+    }
+
+    let raw_len = image.raw.len();
+    println!(
+        "File: {} ({} bytes / {:.2} MB)",
+        input.display(),
+        raw_len,
+        raw_len as f64 / (1024.0 * 1024.0)
+    );
+
+    println!("Ehdr:");
+    println!(
+        "  Type           = {} ({})",
+        image.ehdr.type_name(),
+        image.ehdr.e_type
+    );
+    println!(
+        "  Machine        = 0x{:04X} (EM_X86_64={})",
+        image.ehdr.e_machine,
+        image.ehdr.e_machine == upobf_elf::parse::headers::EM_X86_64
+    );
+    println!(
+        "  Entry          = 0x{:016X}{}",
+        image.ehdr.e_entry,
+        if image.is_pie() { " (PIE/ET_DYN)" } else { "" }
+    );
+    println!(
+        "  PhOff/PhNum    = 0x{:X} / {} (entsize {})",
+        image.ehdr.e_phoff, image.ehdr.e_phnum, image.ehdr.e_phentsize
+    );
+    println!(
+        "  ShOff/ShNum    = 0x{:X} / {} (entsize {}, shstrndx {})",
+        image.ehdr.e_shoff,
+        image.ehdr.e_shnum,
+        image.ehdr.e_shentsize,
+        image.ehdr.e_shstrndx
+    );
+
+    println!("Phdrs:");
+    println!(
+        "  {:<13} {:<5} {:<10} {:<18} {:<10} {:<10} Align",
+        "Type", "Flags", "FileOff", "VAddr", "FileSz", "MemSz"
+    );
+    for p in &image.phdrs {
+        println!(
+            "  {:<13} {:<5} 0x{:08X} 0x{:016X} 0x{:08X} 0x{:08X} 0x{:X}",
+            p.type_name(),
+            p.flag_string(),
+            p.p_offset,
+            p.p_vaddr,
+            p.p_filesz,
+            p.p_memsz,
+            p.p_align
+        );
+    }
+
+    if !image.shdrs.is_empty() {
+        println!("Shdrs ({} entries):", image.shdrs.len());
+        println!(
+            "  {:<24} {:<13} {:<8} {:<18} {:<10}",
+            "Name", "Type", "Flags", "Addr", "Size"
+        );
+        for s in &image.shdrs {
+            println!(
+                "  {:<24} {:<13} {:<8} 0x{:016X} 0x{:08X}",
+                truncate(&s.name, 24),
+                s.type_name(),
+                s.flag_string(),
+                s.sh_addr,
+                s.sh_size
+            );
+        }
+    }
+
+    if let Some(d) = &image.dynamic {
+        println!(
+            "Dynamic: {} entries @ file 0x{:X} (size 0x{:X})",
+            d.raw.len(),
+            d.file_offset,
+            d.file_size
+        );
+        if let Some(v) = d.init { println!("  DT_INIT          = 0x{:X}", v); }
+        if let Some(v) = d.fini { println!("  DT_FINI          = 0x{:X}", v); }
+        if let Some(v) = d.init_array {
+            let sz = d.init_arraysz.unwrap_or(0);
+            println!("  DT_INIT_ARRAY    = 0x{:X}  size 0x{:X} ({} entries)",
+                v, sz, sz / 8);
+        }
+        if let Some(v) = d.fini_array {
+            let sz = d.fini_arraysz.unwrap_or(0);
+            println!("  DT_FINI_ARRAY    = 0x{:X}  size 0x{:X} ({} entries)",
+                v, sz, sz / 8);
+        }
+        if let Some(v) = d.preinit_array {
+            let sz = d.preinit_arraysz.unwrap_or(0);
+            println!("  DT_PREINIT_ARRAY = 0x{:X}  size 0x{:X} ({} entries)",
+                v, sz, sz / 8);
+        }
+        if let Some(v) = d.rela {
+            let sz = d.relasz.unwrap_or(0);
+            println!("  DT_RELA          = 0x{:X}  size 0x{:X} ({} entries)",
+                v, sz, sz / 24);
+        }
+        if let Some(v) = d.jmprel {
+            let sz = d.pltrelsz.unwrap_or(0);
+            println!("  DT_JMPREL        = 0x{:X}  size 0x{:X} ({} entries)",
+                v, sz, sz / 24);
+        }
+        if let Some(v) = d.flags { println!("  DT_FLAGS         = 0x{:X}", v); }
+        if let Some(v) = d.flags_1 { println!("  DT_FLAGS_1       = 0x{:X}", v); }
+    } else {
+        println!("Dynamic: <absent>");
+    }
+
+    println!("Needed: {}", image.needed.len());
+    for n in &image.needed {
+        println!("  {}", n);
+    }
+
+    println!(
+        ".rela.dyn: {} entries (RELATIVE={}, GLOB_DAT={}, abs64={}, irelative={}, other={})",
+        image.rela_dyn_summary.total,
+        image.rela_dyn_summary.relative,
+        image.rela_dyn_summary.glob_dat,
+        image.rela_dyn_summary.abs64,
+        image.rela_dyn_summary.irelative,
+        image.rela_dyn_summary.other
+    );
+    println!(
+        ".rela.plt: {} entries (JUMP_SLOT={}, other={})",
+        image.rela_plt_summary.total,
+        image.rela_plt_summary.jump_slot,
+        image.rela_plt_summary.other
+    );
+
+    println!(".dynsym: {} symbols", image.dynsym.len());
+
+    if let Some(eh) = &image.eh_frame_hdr {
+        println!(
+            ".eh_frame_hdr: file 0x{:X} size 0x{:X} (v{}, ptr_enc=0x{:02X}, fde_count_enc=0x{:02X}, table_enc=0x{:02X})",
+            eh.file_offset, eh.size, eh.version,
+            eh.eh_frame_ptr_enc, eh.fde_count_enc, eh.table_enc
+        );
+    } else {
+        println!(".eh_frame_hdr: <absent>");
+    }
+
+    println!("Notes: {}", image.notes.len());
+    for n in &image.notes {
+        println!(
+            "  owner={} type={} ({} bytes): {}",
+            n.name,
+            n.note_type,
+            n.desc.len(),
+            n.desc_hex()
+        );
+    }
+
+    Ok(())
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n.saturating_sub(1)]) }
+}
+
+fn cmd_inspect_pe(input: PathBuf, json: bool) -> Result<()> {
     let image = upobf_pe::PeImage::from_file(&input)
         .with_context(|| format!("failed to parse {}", input.display()))?;
 
@@ -260,6 +466,15 @@ fn cmd_inspect(input: PathBuf, json: bool) -> Result<()> {
 }
 
 fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {
+    match detect_format(&input)? {
+        Format::Pe => cmd_pack_pe(input, output, _no_compress, _no_encrypt),
+        Format::Elf => bail!(
+            "ELF packing not yet implemented (M1L pending); inspect mode works"
+        ),
+    }
+}
+
+fn cmd_pack_pe(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {
     use upobf_core::stub_link::{link, parse_coff};
     use upobf_core::crypto::prng::Polymorphic;
     use upobf_core::obfuscate::section_names;
@@ -490,7 +705,8 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
         }
     }
 
-    let payload = build_payload_v2(&inputs, &poly, oep_args).context("build payload")?;
+    let payload = build_payload_v2(&inputs, &upobf_pe::build::payload::API_NAMES, &poly, oep_args)
+        .context("build payload")?;
 
     // ---- Assemble packed PE --------------------------------------------
     let mut builder = PackedPeBuilder::new(&image, linked, payload.bytes);

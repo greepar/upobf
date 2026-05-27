@@ -1,0 +1,576 @@
+//! Cross-platform payload blob builder.
+//!
+//! Translates a list of `(target_rva, raw_bytes, original_protect)` tuples
+//! into the on-wire payload format defined in `docs/protocol-m4.md`:
+//!
+//!   PayloadHeader (164 bytes V2, packed)
+//!   ChunkEntry[N] (40 bytes each, packed)
+//!   ApiStringTable (encrypted)
+//!   ChunkData (encrypted+compressed+filtered, concatenated)
+//!
+//! The struct sizes are asserted at compile time so a packer/stub
+//! divergence becomes a build error instead of a runtime crash.
+//!
+//! # Cross-platform design
+//!
+//! The wire format is identical for PE and ELF. The only platform
+//! variation is the **content** of the API string table (Win32
+//! KERNEL32 names for PE; libc/libdl/libpthread names for ELF).
+//! Callers pass an [`ApiNames`] slice describing the table; the stub
+//! looks it up by index, so caller and stub must agree on order.
+
+use anyhow::{Context, Result};
+use byteorder::{ByteOrder, LittleEndian};
+
+use crate::{
+    compress::lzma_compress,
+    crypto::{
+        chacha20::{self, Key, Nonce},
+        prng::Polymorphic,
+    },
+    filter::bcj_x86,
+};
+
+// ---------------------------------------------------------------------------
+// Wire-format constants (must match `stubs/<target>/include/payload.h`).
+// ---------------------------------------------------------------------------
+
+pub const UPOBF_PAYLOAD_MAGIC: u32 = 0x42504F55; // 'U','P','O','B' little-endian
+/// Phase I bumped this from 1 to 2: header layout grew by 80 bytes
+/// at the tail (oep_steal_len/oep_target_rva/oep_patch_rva + 32 bytes
+/// of stolen prologue + 4 reserved). Stub keys behaviour off this.
+pub const UPOBF_PAYLOAD_VERSION: u32 = 2;
+pub const UPOBF_FLAG_BCJ_X86: u32 = 1 << 0;
+pub const UPOBF_FLAG_LZMA: u32 = 1 << 1;
+pub const UPOBF_FLAG_CHACHA20: u32 = 1 << 2;
+
+/// V1 header size kept as a comment landmark: 10 * 4 + 32 + 12 = 84.
+/// V2 adds: 4 * u32 + UPOBF_OEP_STEAL_MAX = 16 + 64 = 80 bytes
+/// after master_nonce. Total: 84 + 80 = 164 bytes.
+pub const PAYLOAD_HEADER_SIZE: usize = 164;
+pub const CHUNK_ENTRY_SIZE: usize = 40;
+
+/// Maximum bytes the on-wire `oep_stolen_bytes` slot can hold —
+/// the *encoded* trampoline body (PI verbatim + rewritten rel-
+/// branches). Mirrors `UPOBF_OEP_STEAL_MAX` in the stub.
+pub const OEP_STEAL_MAX: usize = 64;
+
+/// Number of bytes the stub patches into the host's OEP. Mirrors
+/// `UPOBF_OEP_PATCH_GADGET_LEN`. Stub-side fixed.
+pub const OEP_PATCH_GADGET_LEN: usize = 14;
+
+/// Hard cap, mirrors `UPOBF_MAX_CHUNK_COUNT` in the stub.
+pub const MAX_CHUNK_COUNT: usize = 64;
+/// Hard cap, mirrors `UPOBF_MAX_API_TABLE_SIZE` in the stub.
+pub const MAX_API_TABLE_SIZE: usize = 4096;
+
+/// First 12 bytes of the ASCII string `"upobf:apinonce"` (matches the stub).
+pub const FIXED_API_NONCE: [u8; 12] = *b"upobf:apinon";
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+
+/// One section of the host image we want to compress and decode at runtime.
+#[derive(Debug, Clone)]
+pub struct PayloadInput {
+    /// RVA where the stub must write the decoded bytes.
+    pub target_rva: u32,
+    /// Final size of the decoded region (the stub writes at most this many
+    /// bytes; the OS Loader has already mapped the section).
+    pub virtual_size: u32,
+    /// Original page-protection (PE: `IMAGE_SECTION_HEADER.Characteristics`-
+    /// derived `PAGE_*` constant; ELF: `PROT_*` mask) so the stub can
+    /// restore the original protect after writing.
+    pub original_protect: u32,
+    /// Raw bytes from the original section.
+    pub data: Vec<u8>,
+    /// Apply the BCJ x86 filter before LZMA. Improves compression for
+    /// instruction streams (`.text`) but **mangles** non-code data
+    /// because the filter rewrites bytes that look like x86
+    /// `call`/`jmp rel32` opcodes. `.rdata` and similar
+    /// non-instruction sections must set this to `false`.
+    pub apply_bcj: bool,
+}
+
+/// Names that populate the `ApiStringTable`. Each entry is
+/// `(module_name, function_name)`. Ordering is part of the protocol —
+/// the stub indexes by position.
+pub type ApiNames<'a> = &'a [(&'a str, &'a str)];
+
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
+
+/// Result of building a payload: bytes ready to be embedded plus key
+/// material so the test layer can sanity-check round-trips.
+#[derive(Debug)]
+pub struct BuiltPayload {
+    pub bytes: Vec<u8>,
+    pub master_key: Key,
+    pub master_nonce: Nonce,
+}
+
+/// Phase I: optional OEP-stealing trampoline arguments.
+///   * `encoded` is the trampoline body (PI bytes verbatim and
+///     rewritten rel-branches). Length must lie in
+///     `OEP_PATCH_GADGET_LEN..=OEP_STEAL_MAX`.
+///   * `steal_len` is the number of *original* bytes the packer
+///     overwrote at the host's OEP with `0xCC` int3 fillers — also
+///     the bytes the stub patches over with its 14-byte abs-jmp
+///     gadget. Must lie in `OEP_PATCH_GADGET_LEN..=encoded.len()`.
+///   * `target_rva` is the RVA at which the host's prologue
+///     starts; the trampoline jumps back to
+///     `target_rva + steal_len` after running.
+///   * `patch_rva` is the RVA where the stub writes the abs-jmp
+///     gadget (typically equal to `target_rva`).
+///
+/// Pass `None` to keep the V2 header valid but with
+/// `oep_steal_len = 0`, signalling the stub to skip the redirect.
+#[derive(Debug, Clone)]
+pub struct OepStealArgs {
+    pub encoded: Vec<u8>,
+    pub steal_len: u32,
+    pub target_rva: u32,
+    pub patch_rva: u32,
+}
+
+/// Build a payload blob with the given API name list and no OEP
+/// trampoline.
+pub fn build_payload(
+    inputs: &[PayloadInput],
+    api_names: ApiNames<'_>,
+    poly: &Polymorphic,
+) -> Result<BuiltPayload> {
+    build_payload_v2(inputs, api_names, poly, None)
+}
+
+/// V2 builder: caller provides the API name list and an optional OEP
+/// stealing descriptor. The previous PE-specific call sites kept a
+/// hard-coded API list; now both PE and ELF point to their own
+/// constants and call this function.
+pub fn build_payload_v2(
+    inputs: &[PayloadInput],
+    api_names: ApiNames<'_>,
+    poly: &Polymorphic,
+    oep: Option<OepStealArgs>,
+) -> Result<BuiltPayload> {
+    if inputs.len() > MAX_CHUNK_COUNT {
+        anyhow::bail!(
+            "too many input chunks ({}); MAX_CHUNK_COUNT={}",
+            inputs.len(),
+            MAX_CHUNK_COUNT
+        );
+    }
+
+    if let Some(o) = &oep {
+        if o.encoded.len() < OEP_PATCH_GADGET_LEN || o.encoded.len() > OEP_STEAL_MAX {
+            anyhow::bail!(
+                "OEP encoded trampoline length {} out of range [{}..={}]",
+                o.encoded.len(),
+                OEP_PATCH_GADGET_LEN,
+                OEP_STEAL_MAX
+            );
+        }
+        if (o.steal_len as usize) < OEP_PATCH_GADGET_LEN {
+            anyhow::bail!(
+                "OEP steal_len {} below gadget length {}",
+                o.steal_len,
+                OEP_PATCH_GADGET_LEN
+            );
+        }
+    }
+
+    let master_key = poly.derive_key("payload.master.key");
+    let master_nonce = poly.derive_nonce("payload.master.nonce");
+
+    // ---- 1. Encode each chunk ------------------------------------------
+    struct EncodedChunk {
+        target_rva: u32,
+        virtual_size: u32,
+        original_protect: u32,
+        bcj_base: u32,
+        flags: u32,
+        sub_nonce: [u8; 12],
+        bytes: Vec<u8>,
+    }
+    let mut encoded: Vec<EncodedChunk> = Vec::with_capacity(inputs.len());
+    for (i, inp) in inputs.iter().enumerate() {
+        // BCJ forward — opt-in per chunk. The filter rewrites bytes
+        // that look like x86 call/jmp rel32 opcodes and is a clear
+        // win on `.text` (typically 5-15% extra compression) but
+        // **mangles** non-code data, so callers feeding in `.rdata`
+        // chunks etc. must set `apply_bcj=false`.
+        let mut buf = inp.data.clone();
+        let mut chunk_flags = UPOBF_FLAG_LZMA | UPOBF_FLAG_CHACHA20;
+        if inp.apply_bcj {
+            bcj_x86::forward(&mut buf, inp.target_rva);
+            chunk_flags |= UPOBF_FLAG_BCJ_X86;
+        }
+
+        // LZMA compress.
+        let compressed = lzma_compress(&buf)
+            .with_context(|| format!("LZMA compress chunk #{}", i))?;
+        // Drop the working buffer asap.
+        drop(buf);
+
+        // Per-chunk sub-nonce derivation.
+        let label = format!("payload.chunk.{}.nonce", i);
+        let sub_nonce_full: [u8; 32] = poly.derive(&label);
+        let mut sub_nonce = [0u8; 12];
+        sub_nonce.copy_from_slice(&sub_nonce_full[..12]);
+
+        // ChaCha20 encrypt with effective nonce = master_nonce XOR sub_nonce.
+        let chunk_nonce = xor12(&master_nonce, &sub_nonce);
+        let mut ct = compressed;
+        chacha20::encrypt_in_place(&mut ct, &master_key, &chunk_nonce)
+            .with_context(|| format!("ChaCha20 encrypt chunk #{}", i))?;
+
+        encoded.push(EncodedChunk {
+            target_rva: inp.target_rva,
+            virtual_size: inp.virtual_size,
+            original_protect: inp.original_protect,
+            bcj_base: inp.target_rva,
+            flags: chunk_flags,
+            sub_nonce,
+            bytes: ct,
+        });
+    }
+
+    // ---- 2. Build encrypted ApiStringTable -----------------------------
+    let api_table_plain = build_api_table_plain(api_names)?;
+    if api_table_plain.len() > MAX_API_TABLE_SIZE {
+        anyhow::bail!(
+            "API string table {} bytes exceeds MAX_API_TABLE_SIZE={}",
+            api_table_plain.len(),
+            MAX_API_TABLE_SIZE
+        );
+    }
+    let api_nonce = xor12(&master_nonce, &FIXED_API_NONCE);
+    let mut api_table = api_table_plain.clone();
+    chacha20::encrypt_in_place(&mut api_table, &master_key, &api_nonce)
+        .context("ChaCha20 encrypt API table")?;
+
+    // ---- 3. Compute layout offsets -------------------------------------
+    let chunks_offset: u32 = PAYLOAD_HEADER_SIZE as u32;
+    let chunks_size: u32 = (encoded.len() * CHUNK_ENTRY_SIZE) as u32;
+    let api_table_offset: u32 = chunks_offset + chunks_size;
+    let api_table_size: u32 = api_table.len() as u32;
+    let data_offset: u32 = api_table_offset + api_table_size;
+
+    let mut chunk_offsets = Vec::with_capacity(encoded.len());
+    let mut running: u32 = 0;
+    for ec in &encoded {
+        chunk_offsets.push(running);
+        running = running
+            .checked_add(ec.bytes.len() as u32)
+            .context("chunk data offset overflow")?;
+    }
+    let data_size: u32 = running;
+
+    // ---- 4. Serialise --------------------------------------------------
+    let total_size: usize = data_offset as usize + data_size as usize;
+    let mut out = vec![0u8; total_size];
+
+    // Pack OEP-stealing fields. `oep_steal_len = 0` means feature
+    // disabled. The stolen-bytes slot is always zero-padded to
+    // OEP_STEAL_MAX so a static analyser cannot read header layout
+    // off the high-water mark.
+    let (oep_steal_len, oep_encoded_len, oep_target_rva, oep_patch_rva, oep_bytes) = match oep {
+        Some(o) => {
+            let mut buf = [0u8; OEP_STEAL_MAX];
+            buf[..o.encoded.len()].copy_from_slice(&o.encoded);
+            (
+                o.steal_len,
+                o.encoded.len() as u32,
+                o.target_rva,
+                o.patch_rva,
+                buf,
+            )
+        }
+        None => (0u32, 0u32, 0u32, 0u32, [0u8; OEP_STEAL_MAX]),
+    };
+
+    // PayloadHeader
+    write_payload_header(
+        &mut out[0..PAYLOAD_HEADER_SIZE],
+        Header {
+            magic: UPOBF_PAYLOAD_MAGIC,
+            version: UPOBF_PAYLOAD_VERSION,
+            header_size: PAYLOAD_HEADER_SIZE as u32,
+            chunk_count: encoded.len() as u32,
+            chunks_offset,
+            api_table_offset,
+            api_table_size,
+            data_offset,
+            data_size,
+            flags: 0,
+            master_key,
+            master_nonce,
+            oep_steal_len,
+            oep_encoded_len,
+            oep_target_rva,
+            oep_patch_rva,
+            oep_stolen_bytes: oep_bytes,
+        },
+    );
+
+    // ChunkEntry[]
+    for (i, ec) in encoded.iter().enumerate() {
+        let off = chunks_offset as usize + i * CHUNK_ENTRY_SIZE;
+        write_chunk_entry(
+            &mut out[off..off + CHUNK_ENTRY_SIZE],
+            ChunkRow {
+                target_rva: ec.target_rva,
+                virtual_size: ec.virtual_size,
+                data_offset: chunk_offsets[i],
+                data_size: ec.bytes.len() as u32,
+                original_protect: ec.original_protect,
+                bcj_base: ec.bcj_base,
+                flags: ec.flags,
+                sub_nonce: ec.sub_nonce,
+            },
+        );
+    }
+
+    // ApiStringTable
+    out[api_table_offset as usize..(api_table_offset + api_table_size) as usize]
+        .copy_from_slice(&api_table);
+
+    // ChunkData
+    let mut cursor = data_offset as usize;
+    for ec in &encoded {
+        out[cursor..cursor + ec.bytes.len()].copy_from_slice(&ec.bytes);
+        cursor += ec.bytes.len();
+    }
+    debug_assert_eq!(cursor, total_size);
+
+    Ok(BuiltPayload {
+        bytes: out,
+        master_key,
+        master_nonce,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn xor12(a: &[u8; 12], b: &[u8; 12]) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    for i in 0..12 {
+        out[i] = a[i] ^ b[i];
+    }
+    out
+}
+
+struct Header {
+    magic: u32,
+    version: u32,
+    header_size: u32,
+    chunk_count: u32,
+    chunks_offset: u32,
+    api_table_offset: u32,
+    api_table_size: u32,
+    data_offset: u32,
+    data_size: u32,
+    flags: u32,
+    master_key: [u8; 32],
+    master_nonce: [u8; 12],
+    oep_steal_len: u32,
+    oep_encoded_len: u32,
+    oep_target_rva: u32,
+    oep_patch_rva: u32,
+    oep_stolen_bytes: [u8; OEP_STEAL_MAX],
+}
+
+fn write_payload_header(buf: &mut [u8], h: Header) {
+    debug_assert_eq!(buf.len(), PAYLOAD_HEADER_SIZE);
+    LittleEndian::write_u32(&mut buf[0..4], h.magic);
+    LittleEndian::write_u32(&mut buf[4..8], h.version);
+    LittleEndian::write_u32(&mut buf[8..12], h.header_size);
+    LittleEndian::write_u32(&mut buf[12..16], h.chunk_count);
+    LittleEndian::write_u32(&mut buf[16..20], h.chunks_offset);
+    LittleEndian::write_u32(&mut buf[20..24], h.api_table_offset);
+    LittleEndian::write_u32(&mut buf[24..28], h.api_table_size);
+    LittleEndian::write_u32(&mut buf[28..32], h.data_offset);
+    LittleEndian::write_u32(&mut buf[32..36], h.data_size);
+    LittleEndian::write_u32(&mut buf[36..40], h.flags);
+    buf[40..72].copy_from_slice(&h.master_key);
+    buf[72..84].copy_from_slice(&h.master_nonce);
+    // V2 tail (Phase I)
+    LittleEndian::write_u32(&mut buf[84..88], h.oep_steal_len);
+    LittleEndian::write_u32(&mut buf[88..92], h.oep_encoded_len);
+    LittleEndian::write_u32(&mut buf[92..96], h.oep_target_rva);
+    LittleEndian::write_u32(&mut buf[96..100], h.oep_patch_rva);
+    buf[100..100 + OEP_STEAL_MAX].copy_from_slice(&h.oep_stolen_bytes);
+}
+
+struct ChunkRow {
+    target_rva: u32,
+    virtual_size: u32,
+    data_offset: u32,
+    data_size: u32,
+    original_protect: u32,
+    bcj_base: u32,
+    flags: u32,
+    sub_nonce: [u8; 12],
+}
+
+fn write_chunk_entry(buf: &mut [u8], c: ChunkRow) {
+    debug_assert_eq!(buf.len(), CHUNK_ENTRY_SIZE);
+    LittleEndian::write_u32(&mut buf[0..4], c.target_rva);
+    LittleEndian::write_u32(&mut buf[4..8], c.virtual_size);
+    LittleEndian::write_u32(&mut buf[8..12], c.data_offset);
+    LittleEndian::write_u32(&mut buf[12..16], c.data_size);
+    LittleEndian::write_u32(&mut buf[16..20], c.original_protect);
+    LittleEndian::write_u32(&mut buf[20..24], c.bcj_base);
+    LittleEndian::write_u32(&mut buf[24..28], c.flags);
+    buf[28..40].copy_from_slice(&c.sub_nonce);
+}
+
+/// Build the plaintext API string table. The layout matches the C
+/// definitions in `payload.h`:
+///
+/// ```text
+///   ApiTableHeader { count: u32 }
+///   ApiEntry[count] { module_off:u16, function_off:u16, module_len:u16, function_len:u16 }
+///   <byte pool: all module/function strings, deduplicated>
+/// ```
+fn build_api_table_plain(api_names: ApiNames<'_>) -> Result<Vec<u8>> {
+    let api_count = api_names.len();
+    let entries_off: usize = 4; // ApiTableHeader.count
+    let entries_size: usize = api_count * 8;
+    let mut pool: Vec<u8> = Vec::new();
+
+    // Deduplicate strings so the table is compact.
+    let mut interned: Vec<(String, u16)> = Vec::new();
+    let mut intern = |s: &str, pool: &mut Vec<u8>| -> Result<(u16, u16)> {
+        if let Some((_, off)) = interned.iter().find(|(t, _)| t == s) {
+            return Ok((*off, s.len() as u16));
+        }
+        let off_in_pool = pool.len();
+        pool.extend_from_slice(s.as_bytes());
+        let absolute_off = entries_off + entries_size + off_in_pool;
+        if absolute_off > u16::MAX as usize {
+            anyhow::bail!("API string offset overflows u16");
+        }
+        interned.push((s.to_string(), absolute_off as u16));
+        Ok((absolute_off as u16, s.len() as u16))
+    };
+
+    let mut entries_bytes = vec![0u8; entries_size];
+    for (i, (module, function)) in api_names.iter().enumerate() {
+        let (m_off, m_len) = intern(module, &mut pool)?;
+        let (f_off, f_len) = intern(function, &mut pool)?;
+        let off = i * 8;
+        LittleEndian::write_u16(&mut entries_bytes[off..off + 2], m_off);
+        LittleEndian::write_u16(&mut entries_bytes[off + 2..off + 4], f_off);
+        LittleEndian::write_u16(&mut entries_bytes[off + 4..off + 6], m_len);
+        LittleEndian::write_u16(&mut entries_bytes[off + 6..off + 8], f_len);
+    }
+
+    let mut out = Vec::with_capacity(4 + entries_size + pool.len());
+    out.extend_from_slice(&u32::to_le_bytes(api_count as u32));
+    out.extend_from_slice(&entries_bytes);
+    out.extend_from_slice(&pool);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn poly() -> Polymorphic {
+        Polymorphic::new([7u8; 32])
+    }
+
+    /// PE-style API list used purely for round-trip verification.
+    /// Real PE callers use `upobf_pe::build::payload::API_NAMES`; this
+    /// fixture is a faithful copy frozen here so the core tests do
+    /// not depend on the PE crate.
+    const TEST_API_NAMES: &[(&str, &str)] = &[
+        ("KERNEL32.dll", "GetModuleHandleW"),
+        ("KERNEL32.dll", "GetProcAddress"),
+        ("KERNEL32.dll", "VirtualProtect"),
+        ("KERNEL32.dll", "VirtualAlloc"),
+        ("KERNEL32.dll", "VirtualFree"),
+        ("KERNEL32.dll", "IsDebuggerPresent"),
+        ("KERNEL32.dll", "GetCurrentProcess"),
+        ("KERNEL32.dll", "GetCurrentThread"),
+        ("KERNEL32.dll", "GetThreadContext"),
+        ("KERNEL32.dll", "CreateThread"),
+        ("KERNEL32.dll", "Sleep"),
+        ("KERNEL32.dll", "CloseHandle"),
+    ];
+
+    #[test]
+    fn header_layout_size_matches_protocol() {
+        // V1 prefix: 10*4 + 32 + 12 = 84.
+        // V2 tail:    4*4 + OEP_STEAL_MAX = 16 + 64 = 80.
+        // Total header: 164.
+        assert_eq!(PAYLOAD_HEADER_SIZE, 10 * 4 + 32 + 12 + 4 * 4 + OEP_STEAL_MAX);
+        assert_eq!(CHUNK_ENTRY_SIZE, 7 * 4 + 12);
+    }
+
+    #[test]
+    fn build_empty_payload() {
+        let p = build_payload(&[], TEST_API_NAMES, &poly()).unwrap();
+        assert!(p.bytes.len() >= PAYLOAD_HEADER_SIZE);
+        let magic = LittleEndian::read_u32(&p.bytes[0..4]);
+        assert_eq!(magic, UPOBF_PAYLOAD_MAGIC);
+        let chunk_count = LittleEndian::read_u32(&p.bytes[12..16]);
+        assert_eq!(chunk_count, 0);
+    }
+
+    #[test]
+    fn roundtrip_one_chunk() {
+        // Build a tiny chunk; verify we can decrypt+decompress+BCJ-back.
+        let original: Vec<u8> = (0..256u32).map(|x| x as u8).collect();
+        let target_rva = 0x1000;
+        let inp = PayloadInput {
+            target_rva,
+            virtual_size: original.len() as u32,
+            original_protect: 0x4000_0040, // R | initialized data
+            data: original.clone(),
+            apply_bcj: true,
+        };
+        let p = build_payload(&[inp], TEST_API_NAMES, &poly()).unwrap();
+
+        // Walk the chunk entry.
+        let chunks_off = LittleEndian::read_u32(&p.bytes[16..20]) as usize;
+        let api_off = LittleEndian::read_u32(&p.bytes[20..24]) as usize;
+        let _api_size = LittleEndian::read_u32(&p.bytes[24..28]);
+        let data_off = LittleEndian::read_u32(&p.bytes[28..32]) as usize;
+        assert_eq!(chunks_off, PAYLOAD_HEADER_SIZE);
+        assert!(api_off > chunks_off);
+        assert!(data_off > api_off);
+
+        let ce = &p.bytes[chunks_off..chunks_off + CHUNK_ENTRY_SIZE];
+        assert_eq!(LittleEndian::read_u32(&ce[0..4]), target_rva);
+        assert_eq!(
+            LittleEndian::read_u32(&ce[4..8]),
+            original.len() as u32
+        );
+        let chunk_data_size = LittleEndian::read_u32(&ce[12..16]) as usize;
+        let mut sub_nonce = [0u8; 12];
+        sub_nonce.copy_from_slice(&ce[28..40]);
+
+        // Decrypt chunk
+        let mut payload_data = p.bytes[data_off..data_off + chunk_data_size].to_vec();
+        let chunk_nonce = xor12(&p.master_nonce, &sub_nonce);
+        chacha20::decrypt_in_place(&mut payload_data, &p.master_key, &chunk_nonce).unwrap();
+
+        // LZMA decompress
+        let mut decompressed =
+            crate::compress::lzma_decompress(&payload_data).unwrap();
+        // BCJ backward
+        bcj_x86::backward(&mut decompressed, target_rva);
+
+        assert_eq!(decompressed, original);
+    }
+}

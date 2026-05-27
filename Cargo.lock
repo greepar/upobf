@@ -621,6 +621,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "upobf-core",
+ "upobf-elf",
  "upobf-pe",
 ]
 
@@ -632,6 +633,7 @@ dependencies = [
  "byteorder",
  "chacha20",
  "crc32fast",
+ "iced-x86",
  "rand",
  "rand_chacha",
  "serde",
@@ -646,6 +648,11 @@ name = "upobf-elf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
  "upobf-core",
 ]
 
@@ -663,7 +670,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "byteorder",
- "iced-x86",
  "serde",
  "serde_json",
  "thiserror",

@@ -36,6 +36,11 @@ Thumbs.db
 # Provided externally; place under demo/ before running tests.
 /demo/*.exe
 
+# Linux demo binaries (Phase J). The integration tests look for
+# `Demo/PatchInstaller` etc.; the binaries are large and provided
+# externally rather than tracked in git.
+/Demo/
+
 # LLVM 21.1.0 prebuilt dev SDK (~4 GB). Phase A1 needs the headers
 # and import libraries that the upstream `clang+llvm-...` archive
 # provides. The bootstrap step in the README downloads the archive

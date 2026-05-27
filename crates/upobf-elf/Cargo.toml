@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Linux ELF (x64) support for upobf (placeholder for V2)."
+description = "Linux ELF (x64) parsing, layout and packing for upobf."
 
 [dependencies]
 upobf-core.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+byteorder.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
