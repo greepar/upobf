@@ -20,7 +20,8 @@
 - [x] **Phase G** Import 表 API 名延迟解析（IAT 仅留 `GetModuleHandleW + GetProcAddress` 两个锚点；其余 9 个 API 全部从加密 ApiStringTable 在 TLS callback 内 GetProcAddress 解析）
 - [x] **Phase E** `.rdata` 分块压缩（forbidden-page mask + section splitting；demo 进一步从 27.86 MiB 砍到 18.39 MiB / 41.0%）
 - [x] **Phase F** 后台 CRC32 watchdog 线程（每 30 s 重算 chunk 基线；不退出，mismatch 异或进 heap 内 seed；packed.exe 线程数 +1）
-- [ ] **V2** Linux ELF + macOS Mach-O、upobf-cff control-flow flattening
+- [x] **Phase H** `upobf-cff` 控制流扁平化（DemoteRegToStack + dispatcher loop with PRNG-scrambled state IDs；entry/anti_debug/api_resolve/watchdog 走 cff，chacha20/bcj_x86/lzma_dec 豁免）
+- [ ] **V2** Linux ELF + macOS Mach-O
 
 ## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）
 

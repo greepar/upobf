@@ -1,10 +1,13 @@
-# upobf LLVM IR-level obfuscation passes (Phase A1).
+# upobf LLVM IR-level obfuscation passes (Phase A1 + Phase H).
 #
-# Builds a single shared library `upobf-passes.dll` that exposes two
-# function passes through the LLVM new-pass-manager plugin ABI:
+# Builds a single shared library `upobf-passes.dll` that exposes
+# three function passes through the LLVM new-pass-manager plugin
+# ABI:
 #
 #   - upobf-mba   : Mixed Boolean-Arithmetic instruction substitution.
 #   - upobf-bcf   : Bogus control-flow injection.
+#   - upobf-cff   : Control-flow flattening (demote-to-stack +
+#                   dispatcher loop with PRNG-scrambled state IDs).
 #
 # Built against the LLVM 21.1.0 prebuilt dev SDK that lives under
 # `<repo>/.tools/clang+llvm-21.1.0-x86_64-pc-windows-msvc`. The path
@@ -56,6 +59,7 @@ add_library(upobf-passes SHARED
     src/Plugin.cpp
     src/InstSub.cpp
     src/BogusCF.cpp
+    src/Cff.cpp
 )
 
 # Map cmake component names to actual lib targets exported by

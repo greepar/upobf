@@ -100,11 +100,25 @@ if ($PassPlugin -and (Test-Path -LiteralPath $PassPlugin)) {
     }
 }
 
-# Files that bypass the IR pipeline. lzma_dec.c is vendored and big;
-# transforming it doubles its size for negligible RE benefit. The
-# files listed here go through the legacy `clang -c` step regardless
-# of -PassPlugin.
+# Files that bypass the IR pipeline entirely. lzma_dec.c is vendored
+# and big; transforming it doubles its size for negligible RE
+# benefit. The files listed here go through the legacy `clang -c`
+# step regardless of -PassPlugin.
 $bypassIRPipeline = @('lzma_dec')
+
+# Files that go through the IR pipeline but skip the CFF (control-
+# flow flattening) pass. CFF demotes every cross-block SSA value to
+# a stack alloca + dispatcher loop, which is great for opacity but
+# wrecks codegen on tight inner loops. We exempt:
+#   - chacha20.c : RFC 8439 quarter-round inner loop, hot path of
+#                  every chunk decode.
+#   - bcj_x86.c  : the x86 BCJ filter is also a tight byte-stream
+#                  loop; CFF would 5-8x its dynamic instruction
+#                  count.
+# Everything else (entry / anti_debug / api_resolve / watchdog) is
+# either off the hot path or runs once per process startup, where
+# the obfuscation win is well worth the slowdown.
+$cffBypass = @('chacha20', 'bcj_x86')
 
 if ($useIRPipeline -and $Verbose) {
     Write-Host "[stub-build] IR pipeline ENABLED"
@@ -162,6 +176,7 @@ foreach ($src in $sources) {
     foreach ($ch in [char[]]$base) { $perFileSalt = ($perFileSalt + [int]$ch) -band 0xFFFF }
     $mbaSeed = [uint32]($PassSeed -bxor ($perFileSalt + 0xC0FFEE))
     $bcfSeed = [uint32]($PassSeed -bxor ($perFileSalt + 0xBADC0DE))
+    $cffSeed = [uint32]($PassSeed -bxor ($perFileSalt + 0xCAFEFACE))
 
     $cmd1 = @('-c', '-emit-llvm', $src.FullName, '-o', $bc) + $flags + $perFile
     if ($Verbose) {
@@ -174,7 +189,20 @@ foreach ($src in $sources) {
         throw "stub clang -emit-llvm failed for $($src.FullName) (exit $LASTEXITCODE)"
     }
 
-    $passes = "upobf-bcf<seed=$bcfSeed>,upobf-mba<seed=$mbaSeed>"
+    # Pass order matters:
+    #   1. CFF first  : flatten the original CFG before BCF synthesises
+    #      its guard arms; otherwise BCF's wrapper blocks would also
+    #      get flattened, which compounds the dispatcher's switch and
+    #      adds correctness pressure on the demote-to-stack pass.
+    #   2. BCF second : wrap remaining real blocks with opaque-true
+    #      guards so the analyst sees a real branch even after CFF.
+    #   3. MBA last   : substitute arithmetic on whatever instruction
+    #      stream survived; runs over both real and synthetic blocks.
+    if ($cffBypass -contains $base) {
+        $passes = "upobf-bcf<seed=$bcfSeed>,upobf-mba<seed=$mbaSeed>"
+    } else {
+        $passes = "upobf-cff<seed=$cffSeed>,upobf-bcf<seed=$bcfSeed>,upobf-mba<seed=$mbaSeed>"
+    }
     $cmd2 = @('--load-pass-plugin', $PassPlugin, '--passes', $passes, $bc, '-o', $optBc)
     if ($Verbose) {
         Write-Host "[stub-build] opt $($cmd2 -join ' ')"

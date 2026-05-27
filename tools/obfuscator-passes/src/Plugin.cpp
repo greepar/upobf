@@ -1,15 +1,16 @@
 // upobf-passes plugin entry point.
 //
-// Exposes two function passes through the LLVM new-pass-manager
+// Exposes three function passes through the LLVM new-pass-manager
 // plugin ABI:
 //
 //   - "upobf-mba"   : Mixed Boolean-Arithmetic instruction substitution.
 //   - "upobf-bcf"   : Bogus control-flow injection.
+//   - "upobf-cff"   : Control-flow flattening (Phase H).
 //
-// Both passes accept an optional integer parameter via the pipeline
+// All passes accept an optional integer parameter via the pipeline
 // syntax `upobf-mba<seed=N>` so each invocation of the stub build can
 // drive a different PRNG stream. If no seed is given the pass falls
-// back to a fixed value (0xC0FFEE) so unit tests are reproducible.
+// back to a fixed value so unit tests are reproducible.
 //
 // Plugin host expectation: this DLL is loaded by `opt.exe` from the
 // LLVM 21.1.0 prebuilt dev SDK via `--load-pass-plugin=...`. On
@@ -22,6 +23,7 @@
 
 #include "InstSub.h"
 #include "BogusCF.h"
+#include "Cff.h"
 
 using namespace llvm;
 
@@ -69,6 +71,10 @@ bool registerPipeline(StringRef name, FunctionPassManager &fpm,
     }
     if (rawName == "upobf-bcf") {
         fpm.addPass(upobf::BogusCFPass(parseSeed(params, 0xBADC0DEULL)));
+        return true;
+    }
+    if (rawName == "upobf-cff") {
+        fpm.addPass(upobf::CffPass(parseSeed(params, 0xCAFEFACEULL)));
         return true;
     }
     return false;
