@@ -35,3 +35,14 @@ Thumbs.db
 # Demo test sample (NativeAOT + Avalonia binary, 42 MB).
 # Provided externally; place under demo/ before running tests.
 /demo/*.exe
+
+# LLVM 21.1.0 prebuilt dev SDK (~4 GB). Phase A1 needs the headers
+# and import libraries that the upstream `clang+llvm-...` archive
+# provides. The bootstrap step in the README downloads the archive
+# to `.tools/`; we never commit it.
+/.tools/
+
+# Phase A1 IR-pass plugin build output (CMake / Ninja).
+/tools/obfuscator-passes/build/
+/tools/obfuscator-passes/**/*.bc
+/tools/obfuscator-passes/**/*.ll

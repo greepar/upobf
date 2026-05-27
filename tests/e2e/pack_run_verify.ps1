@@ -10,7 +10,18 @@ param(
     [string]$InputPath  = "demo\PatchInstaller.exe",
     [string]$Output     = "packed_e2e.exe",
     [int]$RuntimeSeconds = 5,
-    [switch]$NoCompress
+    [switch]$NoCompress,
+    # Phase A1: when set, build the stub through the IR-level pass
+    # plugin (`tools/obfuscator-passes/build/Release/upobf-passes.dll`).
+    # The plugin must already be built; we don't auto-build it here
+    # because it has its own dev-SDK prerequisites (LLVM 21 dev libs
+    # under .tools/).
+    [switch]$WithIRPipeline,
+    # Override the seed forwarded to the IR pass plugin. Defaults to a
+    # value derived from the current time so successive E2E runs
+    # produce visibly different stubs (useful when manually scanning
+    # for static signatures).
+    [uint32]$IRPassSeed = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +37,25 @@ if (-not (Test-Path -LiteralPath $inputPath)) {
 
 # 1. Build stub
 Write-Host "[e2e] Building stub..."
-& (Join-Path $repo 'stubs\pe-x64\build.ps1')
+$stubBuildArgs = @{}
+if ($WithIRPipeline) {
+    $pluginPath = Join-Path $repo 'tools\obfuscator-passes\build\Release\upobf-passes.dll'
+    if (-not (Test-Path -LiteralPath $pluginPath)) {
+        Write-Error "IR pass plugin not found: $pluginPath. Run tools/obfuscator-passes/build.ps1 first."
+        exit 3
+    }
+    $seed = $IRPassSeed
+    if ($seed -eq 0) {
+        # PowerShell's -band on Int64 returns Int64; cast through
+        # uint64 to keep the low 32 bits before narrowing.
+        $low = [uint64]([DateTime]::Now.Ticks) -band 0xFFFFFFFFul
+        $seed = [uint32]$low
+    }
+    Write-Host "[e2e]   IR pipeline ENABLED (plugin=$pluginPath, seed=0x$([Convert]::ToString($seed,16)))"
+    & (Join-Path $repo 'stubs\pe-x64\build.ps1') -PassPlugin $pluginPath -PassSeed $seed
+} else {
+    & (Join-Path $repo 'stubs\pe-x64\build.ps1')
+}
 if ($LASTEXITCODE -ne 0) { Write-Error "stub build failed"; exit 3 }
 
 # 2. Build packer (release for sane perf timings)

@@ -13,7 +13,11 @@
 - [x] **M4** 完整压缩管线 → packed.exe 启动后 NativeAOT + Avalonia UI 正常工作
 - [x] **M5** AV 友好反调试 + 内联 CRC32 完整性 + per-build 多态
 - [x] **M6** E2E 测试脚本（`tests/e2e/pack_run_verify.ps1`），全程自动化验证
-- [ ] **V2** 节名 / Rich header 多态、CFF / BCF 控制流混淆、Linux ELF + macOS Mach-O
+- [x] **Phase 1-3** 节名多态化 + stub 字符串去明文 + PE 头清洗（Rich/TimeDateStamp/LinkerVersion）
+- [x] **Phase C** stub 字节级多态（junk trampoline + dead tail，每构建 stub-section SHA256 全异）
+- [x] **Phase A2** 源码级 CFG / dataflow 混淆原语（`OPAQUE_TRUE/FALSE`、`BOGUS_GUARD`、`JUNK_DATAFLOW`）
+- [x] **Phase A1** LLVM IR 级 pass plugin（MBA 指令替换 + bogus control-flow，新-pass-manager 接入 `opt`）
+- [ ] **V2** Linux ELF + macOS Mach-O、`.rdata` 分块压缩、后台 CRC watchdog
 
 ## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）
 
@@ -116,13 +120,60 @@ E2E 检验：
 
 ## 下一步（V2）
 
-- [ ] 节名多态化（用 `polymorphic.derive("section.{i}")` 派生伪 MSVC 风格名）
-- [ ] Rich Header 伪造
-- [ ] 控制流混淆 stub（自研 LLVM 17+ pass，CFF/BCF/InstSub）
+- [x] 节名多态化（Phase 1，已完成）
+- [x] Rich Header 清零 + TimeDateStamp / LinkerVersion 多态（Phase 3，已完成）
+- [x] 控制流混淆 stub（Phase A1：LLVM 21 IR-level MBA + BCF pass，已完成）
 - [ ] 后台 CRC watchdog 线程
 - [ ] `.rdata` / `.data` 分块压缩（避开 LoadConfig / IAT / 静态字段）
 - [ ] Linux x64 (ELF) 支持
 - [ ] macOS arm64 (Mach-O) 支持
+
+## Phase A1：LLVM IR-level 混淆 pass
+
+`tools/obfuscator-passes/` 是一个 LLVM 21 new-pass-manager plugin，
+产出 `upobf-passes.dll`。提供两个 function pass：
+
+| Pass | 名字 | 作用 |
+|---|---|---|
+| InstSub | `upobf-mba<seed=N>` | 把 `add/sub/xor/and/or` 替换成等价 MBA 表达式（5 条已发表的 MBA 恒等式）|
+| BogusCF | `upobf-bcf<seed=N>` | 在每个 BasicBlock 入口插入 `if (opaquePredicate()) goto B; else goto Junk;` |
+
+opaque predicate 基于 `static const volatile uint8_t upobf_obf_seed_byte`，
+落在 `.rdata`，运行时恒为 true，但编译器无法 const-fold（保 LLVM 21 校验）。
+
+### 一次性引导（约 1 分钟，需要 ~4 GB 磁盘）
+
+```pwsh
+# 1) 下载并解压 LLVM 21.1.0 prebuilt dev SDK 到 .tools/（944 MB 下载，3.85 GB 解压）
+$dlDir = "$PWD\.tools"; New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
+$tar = "$dlDir\clang+llvm-21.1.0-x86_64-pc-windows-msvc.tar.xz"
+Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.0/clang%2Bllvm-21.1.0-x86_64-pc-windows-msvc.tar.xz" -OutFile $tar -UseBasicParsing
+tar.exe -xf $tar -C $dlDir
+# 2) 修补 LLVMExports.cmake：upstream 把 diaguids.lib 硬编码成构建机器的 VS2019 路径，
+#    替换成本机已装的 VS 2022/2026 即可
+$exp = "$dlDir\clang+llvm-21.1.0-x86_64-pc-windows-msvc\lib\cmake\llvm\LLVMExports.cmake"
+(Get-Content $exp -Raw).Replace(
+  "C:/Program Files (x86)/Microsoft Visual Studio/2019/Professional/DIA SDK/lib/amd64/diaguids.lib",
+  "C:/Program Files/Microsoft Visual Studio/18/Community/DIA SDK/lib/amd64/diaguids.lib"
+) | Set-Content $exp -NoNewline
+```
+
+### 构建 plugin + 启用 IR 流水线
+
+```pwsh
+# 编 plugin（约 30 s）
+.\tools\obfuscator-passes\build.ps1            # produces tools/obfuscator-passes/build/Release/upobf-passes.dll
+
+# 用 plugin 编 stub（流水线：clang -emit-llvm -> opt --load-pass-plugin -> llc -filetype=obj）
+$dll = ".\tools\obfuscator-passes\build\Release\upobf-passes.dll"
+.\stubs\pe-x64\build.ps1 -Clean -PassPlugin $dll -PassSeed 0xDEADBEEF
+
+# 端到端测试
+.\tests\e2e\pack_run_verify.ps1 -WithIRPipeline
+```
+
+不传 `-PassPlugin` 时 `stubs\pe-x64\build.ps1` 走传统 `clang -c` 单步路径，
+因此 dev SDK 缺失的机器上原始 E2E 仍然能跑，A1 是**严格 opt-in**。
 
 ## 文档
 
