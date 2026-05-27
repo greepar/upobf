@@ -196,7 +196,9 @@ fn payload_segment_is_appended_when_provided() {
     assert_eq!(new_loads, orig_loads + 2);
 
     // The trailing PT_LOAD .upobf1 (R-only) should host the payload
-    // bytes verbatim at its file offset.
+    // bytes verbatim at its file offset. The writer always sets
+    // p_filesz = upobf1_size (page-aligned) and zero-pads the
+    // tail; check that payload bytes match in the prefix.
     use upobf_elf::parse::headers::PF_R;
     let upobf1 = out
         .phdrs
@@ -204,7 +206,12 @@ fn payload_segment_is_appended_when_provided() {
         .filter(|p| p.p_type == PT_LOAD && p.p_flags == PF_R)
         .last()
         .unwrap();
-    assert_eq!(upobf1.p_filesz, payload.len() as u64);
+    assert!(upobf1.p_filesz >= payload.len() as u64);
+    assert_eq!(upobf1.p_filesz % 0x1000, 0, "filesz must be page-aligned");
     let off = upobf1.p_offset as usize;
     assert_eq!(&bytes[off..off + payload.len()], &payload[..]);
+    // Tail padding must be zero.
+    assert!(bytes[off + payload.len()..off + upobf1.p_filesz as usize]
+        .iter()
+        .all(|&b| b == 0));
 }

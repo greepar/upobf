@@ -473,30 +473,76 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
 }
 
 fn cmd_pack_elf(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {
-    // M1L baseline: passthrough writer with optional stub +
-    // init_array injection. M3L will wire in the real stub blob and
-    // payload; for now the writer is exercised in the simplest mode.
-    use upobf_elf::build::PackedElfBuilder;
+    // M2L: link in the freestanding stub blob (when present), perform
+    // .init_array injection so the stub runs before host main(). M3L
+    // adds the payload chunk pipeline.
+    use upobf_elf::build::{PackedElfBuilder, StubBlob};
 
     let image = upobf_elf::ElfImage::from_file(&input)
         .with_context(|| format!("failed to parse {}", input.display()))?;
+
+    // Locate the freestanding stub `.so`. Layout:
+    //   <crate root>/../../stubs/elf-x64/build/stub.so
+    let stub_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..").join("..").join("stubs").join("elf-x64").join("build").join("stub.so");
+
+    let stub_blob = if stub_path.exists() {
+        Some(StubBlob::from_file(&stub_path)
+            .with_context(|| format!("load stub blob {}", stub_path.display()))?)
+    } else {
+        tracing::warn!(
+            stub = %stub_path.display(),
+            "stub not built; falling back to passthrough mode (run stubs/elf-x64/build.sh)"
+        );
+        None
+    };
 
     tracing::info!(
         path = %input.display(),
         is_pie = image.is_pie(),
         phdrs = image.phdrs.len(),
         shdrs = image.shdrs.len(),
-        "ELF M1L passthrough pack"
+        stub_bytes = stub_blob.as_ref().map(|s| s.bytes.len()).unwrap_or(0),
+        "ELF M2L pack"
     );
 
-    let bytes = PackedElfBuilder::new(&image)
-        .build()
-        .context("build packed ELF (passthrough)")?;
+    // The stub needs to know:
+    //  * its own .data slot offsets so the writer can patch them with
+    //    final image-base RVA + payload vaddr.
+    //  * the stub_init function offset within the blob.
+    let mut builder = PackedElfBuilder::new(&image);
+    if let Some(blob) = &stub_blob {
+        // M2L: empty payload, but we still call build with stub bytes
+        // so the stub runs at startup. The image_base_rva slot is
+        // patched here using the anchor offset.
+        // The anchor lives at offset `image_base_anchor_offset`
+        // inside the flat blob. Once embedded at
+        // `.upobf0_vaddr + PHDR_TABLE_RESERVE`, its runtime VA is
+        // `upobf0_vaddr + PHDR_TABLE_RESERVE + anchor_offset`. The
+        // RVA we bake in equals exactly that VA (since RVA == VA in
+        // ld.so's RELATIVE world for a PIE binary).
+        //
+        // We don't know the upobf0_vaddr until the writer computes
+        // layout, so we patch the slots inside the blob _after_
+        // calling build() — except the writer needs the post-patch
+        // bytes. Easiest fix: ask the writer to expose
+        // upobf0_vaddr; for now, we compute it ourselves with the
+        // same algorithm the writer uses.
+        let upobf0_vaddr = compute_upobf0_vaddr(&image)?;
+        let phdr_reserve = upobf_elf::build::writer::PHDR_TABLE_RESERVE;
+        let anchor_va = upobf0_vaddr + phdr_reserve + blob.image_base_anchor_offset;
+        let payload_va: u64 = 0; // M2L: no payload yet — stub bails on sentinel
+        let patched = blob.patched(anchor_va, payload_va);
+        builder = builder
+            .with_stub(patched, blob.init_offset)
+            .enable_init_array_injection(true);
+    }
+
+    let bytes = builder.build().context("build packed ELF")?;
 
     std::fs::write(&output, &bytes)
         .with_context(|| format!("write {}", output.display()))?;
 
-    // Make output executable (preserve original mode + ensure +x).
     use std::os::unix::fs::PermissionsExt;
     let mut perm = std::fs::metadata(&output)?.permissions();
     perm.set_mode(perm.mode() | 0o755);
@@ -514,6 +560,22 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt
         ((pkt as f64 - orig as f64) / orig as f64) * 100.0,
     );
     Ok(())
+}
+
+/// Compute the .upobf0 vaddr the writer will pick. Mirrors the
+/// algorithm in `PackedElfBuilder::build()`. Used by the CLI to
+/// resolve the stub's image-base anchor before invoking build().
+fn compute_upobf0_vaddr(image: &upobf_elf::ElfImage) -> Result<u64> {
+    use upobf_elf::parse::headers::PT_LOAD;
+    let highest = image
+        .phdrs
+        .iter()
+        .filter(|p| p.p_type == PT_LOAD)
+        .map(|p| p.p_vaddr + p.p_memsz)
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("no PT_LOAD segments"))?;
+    let page_size = upobf_elf::build::writer::page_size();
+    Ok((highest + page_size - 1) & !(page_size - 1))
 }
 
 fn cmd_pack_pe(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {

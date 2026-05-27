@@ -291,7 +291,12 @@ impl<'a> PackedElfBuilder<'a> {
             });
         }
 
-        // Append PT_LOAD .upobf1 (if any)
+        // Append PT_LOAD .upobf1 (if any). Note `p_filesz == p_memsz`
+        // == upobf1_size so the kernel can mmap the full segment in
+        // one shot — small unaligned `p_filesz` (especially when
+        // `p_filesz` < a page) trips the kernel's ELF loader on
+        // some configurations and fails the entire execve with
+        // EFAULT.
         if have_upobf1 {
             new_phdrs.push(Elf64Phdr {
                 p_type: PT_LOAD,
@@ -299,7 +304,7 @@ impl<'a> PackedElfBuilder<'a> {
                 p_offset: upobf1_file_off,
                 p_vaddr: upobf1_vaddr,
                 p_paddr: upobf1_vaddr,
-                p_filesz: payload_bytes.len() as u64,
+                p_filesz: upobf1_size,
                 p_memsz: upobf1_size,
                 p_align: PAGE_SIZE,
             });
