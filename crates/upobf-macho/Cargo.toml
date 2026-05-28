@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "macOS Mach-O (arm64) support for upobf (placeholder for V2)."
+description = "macOS Mach-O (arm64) parser and packer for upobf."
 
 [dependencies]
 upobf-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+byteorder.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
 anyhow.workspace = true

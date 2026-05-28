@@ -43,6 +43,7 @@ enum Command {
 enum Format {
     Pe,
     Elf,
+    Macho,
 }
 
 fn detect_format(path: &std::path::Path) -> Result<Format> {
@@ -57,6 +58,10 @@ fn detect_format(path: &std::path::Path) -> Result<Format> {
     }
     if n >= 2 && buf[..2] == [b'M', b'Z'] {
         return Ok(Format::Pe);
+    }
+    if n >= 4 && buf[..4] == [0xCF, 0xFA, 0xED, 0xFE] {
+        // MH_MAGIC_64 little-endian = 0xFEEDFACF → bytes CF FA ED FE
+        return Ok(Format::Macho);
     }
     bail!(
         "unrecognised file magic: {:02X} {:02X} {:02X} {:02X}",
@@ -89,6 +94,7 @@ fn cmd_inspect(input: PathBuf, json: bool) -> Result<()> {
     match detect_format(&input)? {
         Format::Pe => cmd_inspect_pe(input, json),
         Format::Elf => cmd_inspect_elf(input, json),
+        Format::Macho => cmd_inspect_macho(input, json),
     }
 }
 
@@ -469,6 +475,7 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
     match detect_format(&input)? {
         Format::Pe => cmd_pack_pe(input, output, _no_compress, _no_encrypt),
         Format::Elf => cmd_pack_elf(input, output, _no_compress, _no_encrypt),
+        Format::Macho => cmd_pack_macho(input, output),
     }
 }
 
@@ -1132,5 +1139,115 @@ fn cmd_pack_pe(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt:
         pkt,
         pkt as f64 * 100.0 / orig as f64
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mach-O commands
+// ---------------------------------------------------------------------------
+
+fn cmd_inspect_macho(input: PathBuf, json: bool) -> Result<()> {
+    let image = upobf_macho::parse::MachoImage::from_file(&input)
+        .with_context(|| format!("failed to parse {}", input.display()))?;
+
+    if json {
+        println!("{}", image.to_json_report()?);
+        return Ok(());
+    }
+
+    let raw_len = image.raw.len();
+    println!(
+        "File: {} ({} bytes / {:.2} MB)",
+        input.display(),
+        raw_len,
+        raw_len as f64 / (1024.0 * 1024.0)
+    );
+
+    println!("Header:");
+    println!("  Magic          = 0x{:08X}", image.header.magic);
+    println!("  CpuType        = 0x{:08X} (ARM64={})", image.header.cputype,
+        image.header.cputype == 0x0100_000C);
+    println!("  FileType       = {} ({})", image.header.filetype_name(), image.header.filetype);
+    println!("  NCmds          = {}", image.header.ncmds);
+    println!("  SizeOfCmds     = {}", image.header.sizeofcmds);
+    println!("  Flags          = 0x{:08X} (PIE={})", image.header.flags, image.header.is_pie());
+
+    println!("Segments:");
+    for seg in &image.segments {
+        println!(
+            "  {:<16} vmaddr=0x{:X} vmsize=0x{:X} fileoff=0x{:X} filesize=0x{:X} prot={} nsects={}",
+            seg.segname, seg.vmaddr, seg.vmsize, seg.fileoff, seg.filesize,
+            seg.prot_string(), seg.nsects
+        );
+        for sect in &seg.sections {
+            println!(
+                "    {:<16} addr=0x{:X} size=0x{:X} offset=0x{:X}",
+                sect.sectname, sect.addr, sect.size, sect.offset
+            );
+        }
+    }
+
+    if let Some(ref main_cmd) = image.main_cmd {
+        println!("LC_MAIN: entryoff=0x{:X} stacksize={}", main_cmd.entryoff, main_cmd.stacksize);
+    }
+
+    if let Some(ref bv) = image.build_version {
+        println!("LC_BUILD_VERSION: platform={} minos={} sdk={}",
+            bv.platform_name(), bv.minos_string(), bv.sdk_string());
+    }
+
+    println!("Dylibs:");
+    for d in image.needed_dylibs() {
+        println!("  {}", d);
+    }
+
+    if let Some(ref cf) = image.chained_fixups {
+        println!("Chained Fixups: {} imports, {} segment starts",
+            cf.imports_count, cf.starts.seg_count);
+    }
+
+    if let Some(ref st) = image.symtab {
+        println!("Symtab: {} symbols, strsize={}", st.cmd.nsyms, st.cmd.strsize);
+    }
+
+    Ok(())
+}
+
+fn cmd_pack_macho(input: PathBuf, output: PathBuf) -> Result<()> {
+    use upobf_macho::pack::{pack_macho, PackConfig};
+
+    // Check if --no-compress was passed (quick hack via env var for now)
+    let no_compress = std::env::var("UPOBF_NO_COMPRESS").is_ok();
+    let config = PackConfig {
+        no_compress,
+        ..Default::default()
+    };
+    let result = pack_macho(&input, &config)
+        .with_context(|| format!("pack {}", input.display()))?;
+
+    std::fs::write(&output, &result.bytes)
+        .with_context(|| format!("write {}", output.display()))?;
+
+    // Set executable permission.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perm = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&output, perm)?;
+    }
+
+    println!(
+        "packed: {} -> {} ({} -> {} bytes, {:.1}%)",
+        input.display(),
+        output.display(),
+        result.original_size,
+        result.packed_size,
+        result.packed_size as f64 * 100.0 / result.original_size as f64
+    );
+    println!(
+        "  chunks: {}, compressed: {} bytes",
+        result.chunk_count, result.total_compressed_bytes
+    );
+
     Ok(())
 }

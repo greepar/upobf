@@ -622,6 +622,7 @@ dependencies = [
  "tracing-subscriber",
  "upobf-core",
  "upobf-elf",
+ "upobf-macho",
  "upobf-pe",
 ]
 
@@ -661,6 +662,11 @@ name = "upobf-macho"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
+ "rand",
+ "serde",
+ "serde_json",
+ "tracing",
  "upobf-core",
 ]
 
