@@ -22,7 +22,17 @@
 - [x] **Phase F** 后台 CRC32 watchdog 线程（每 30 s 重算 chunk 基线；不退出，mismatch 异或进 heap 内 seed；packed.exe 线程数 +1）
 - [x] **Phase H** `upobf-cff` 控制流扁平化（DemoteRegToStack + dispatcher loop with PRNG-scrambled state IDs；entry/anti_debug/api_resolve/watchdog 走 cff，chacha20/bcj_x86/lzma_dec 豁免）
 - [x] **Phase I** OEP redirect + stolen bytes（iced-x86 LDE 解码 OEP prologue；PI 字节直拷、`call/jmp rel32` 重写为 abs 间接形式；packer 把原 prologue 替换成 `0xCC` 后再压缩；stub 解压完 VirtualAlloc 一页 trampoline + 14B abs-jmp 回 host，再把原 OEP 处int3 padding 写回成 `jmp [rip+0]; .quad <heap-VA>`；ProcessHacker dump 出来的 PE OEP 处指向堆 VA，重跑必崩）
-- [ ] **V2** Linux ELF + macOS Mach-O
+- [x] **Phase J / M0L–M4L** Linux ELF（x86_64）端到端：
+  - **M0L** ELF parser（Ehdr/Phdr/Shdr/Dyn/Sym/Rela 全手写零 unsafe）
+  - **M1L** writer：phdr 表搬迁 + DT_INIT_ARRAY 注入 + .upobf{0,1,2} 三段 PT_LOAD
+  - **M2L** freestanding stub（pure RIP-relative，零重定位，纯 syscall，stub.so 一节 R+X）
+  - **M3L** 端到端压缩：`__managedcode` + `__unbox` 全段压缩
+  - **Phase E** 扩展段覆盖：`.text` / `.rodata` / `.dotnet_eh_table`（safe-runs 算法 + tier-1/tier-2 分级）
+  - **Phase H** IR pass plugin Linux 构建：apt LLVM 21、动态 libLLVM 链接修 cl::opt 重复注册
+  - **Phase G** 动态 libc API 解析：`/proc/self/maps` 走 GNU-hash → 8 个 API 槽（pthread/mmap/mprotect/prctl/clock_gettime…）；ChaCha20 解密 ApiTable，PR_SET_DUMPABLE=0 禁 coredump
+  - **Phase F** pthread CRC32 watchdog：30 s 周期，IEEE 802.3 多项式逐字节实现（freestanding 禁可写全局），Avalonia 线程 +1
+  - **Phase I** e_entry 重定向 + `.text` 压缩：rewrite ELF e_entry 到 stub 的 `upobf_entry_trampoline`，trampoline 跑完 `upobf_stub_init`（解压所有 chunk）后跳回 host 原 e_entry。**与 PE 不同**：glibc 的 main exe DT_INIT_ARRAY 由 `__libc_start_main` 调用（即 `_start` 之内），所以 init_array hook 来不及在 `_start` 读取压缩后的 `.text` 之前 fire；只能改 e_entry。
+- [ ] **V2** macOS Mach-O
 
 ## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）
 
@@ -43,7 +53,7 @@
 crates/
   upobf-core   跨平台核心：compress / crypto / filter / obfuscate / policy / stub_link
   upobf-pe     Windows PE 实现：parse / layout / build
-  upobf-elf    V2 占位 (Linux ELF)
+  upobf-elf    Linux ELF 实现：parse / layout / build（M0L–M4L Phase I 完成）
   upobf-macho  V2 占位 (macOS Mach-O)
   upobf-cli    `upobf pack` / `upobf inspect`
 
@@ -56,8 +66,16 @@ stubs/pe-x64/  C + asm，clang 编译的 freestanding stub
     anti_debug.c   IsDebuggerPresent + GetThreadContext + CRC32
   build.ps1      用 clang -ffreestanding -nostdlib 编译
 
+stubs/elf-x64/  C + naked-asm，clang freestanding stub（共享 chacha20/lzma_dec/bcj_x86 与 PE 侧）
+  src/
+    entry.c        e_entry 蹦床 + upobf_stub_init 主循环
+    api_resolve.c  /proc/self/maps + GNU-hash 走 libc，零 dlsym 锚点
+    watchdog.c     pthread 30s CRC32 校验
+  build.sh       clang-21 / ld.lld-21 / opt-21 / llc-21（IR 流水线可选）
+
 tests/
-  e2e/pack_run_verify.ps1   端到端：build → pack → run → 多态校验
+  e2e/pack_run_verify.ps1         Windows 端到端
+  e2e/pack_run_verify_linux.sh    Linux 端到端
 ```
 
 ## 构建
@@ -129,9 +147,9 @@ E2E 检验：
 - [x] 节名多态化（Phase 1，已完成）
 - [x] Rich Header 清零 + TimeDateStamp / LinkerVersion 多态（Phase 3，已完成）
 - [x] 控制流混淆 stub（Phase A1：LLVM 21 IR-level MBA + BCF pass，已完成）
-- [ ] 后台 CRC watchdog 线程
-- [ ] `.rdata` / `.data` 分块压缩（避开 LoadConfig / IAT / 静态字段）
-- [ ] Linux x64 (ELF) 支持
+- [x] 后台 CRC watchdog 线程（Phase F PE + Phase J/M4L Phase F ELF）
+- [x] `.rdata` / `.data` 分块压缩（避开 LoadConfig / IAT / 静态字段）（Phase E PE + Phase J/M4L Phase E ELF）
+- [x] Linux x64 (ELF) 支持（Phase J/M0L–M4L Phase I 完成）
 - [ ] macOS arm64 (Mach-O) 支持
 
 ## Phase A1：LLVM IR-level 混淆 pass
