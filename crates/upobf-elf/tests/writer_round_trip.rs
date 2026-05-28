@@ -43,18 +43,27 @@ fn passthrough_round_trips_demo() {
     // e_entry must not move.
     assert_eq!(out.ehdr.e_entry, img.ehdr.e_entry);
 
-    // PT_PHDR must point inside the new LOAD region (file offset
-    // beyond the original input length).
+    // PT_PHDR must point inside the new .upobf0 LOAD region.
+    // Post-shrink, .upobf0 sits after the host's repacked LOAD
+    // segments at the highest vaddr; we just confirm the new
+    // PT_PHDR vaddr exceeds every original LOAD's vaddr+memsz.
     let new_phdr = out
         .phdrs
         .iter()
         .find(|p| p.p_type == upobf_elf::parse::headers::PT_PHDR)
         .expect("PT_PHDR present");
+    let max_orig_load_end = img
+        .phdrs
+        .iter()
+        .filter(|p| p.p_type == PT_LOAD)
+        .map(|p| p.p_vaddr + p.p_memsz)
+        .max()
+        .unwrap();
     assert!(
-        new_phdr.p_offset >= img.raw.len() as u64,
-        "PT_PHDR offset {:#x} should be in appended region (orig len {:#x})",
-        new_phdr.p_offset,
-        img.raw.len()
+        new_phdr.p_vaddr >= max_orig_load_end,
+        "PT_PHDR vaddr {:#x} should be past the highest original LOAD end {:#x}",
+        new_phdr.p_vaddr,
+        max_orig_load_end,
     );
 
     // Original LOAD count + 1 new (.upobf0).

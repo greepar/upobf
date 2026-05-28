@@ -54,7 +54,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 
 use crate::parse::headers::{
-    Elf64Phdr, PHDR64_SIZE, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
+    Elf64Phdr, PHDR64_SIZE, SHDR64_SIZE, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
 };
 use crate::parse::ElfImage;
 
@@ -66,10 +66,32 @@ use crate::parse::ElfImage;
 const PAGE_SIZE: u64 = 0x1000;
 
 /// Reserved bytes at the head of `.upobf0` for the relocated phdr
-/// table. We pick 0x400 (1 KiB) which fits 18 phdr entries (the demo
-/// has 12 + 2 new = 14, so 18 leaves headroom for future Phase JL
-/// PT_NOTE smuggling or extra PT_GNU_PROPERTY entries).
-pub const PHDR_TABLE_RESERVE: u64 = 0x400;
+/// table. We pick 0x800 (2 KiB) which fits 36 phdr entries. With
+/// LOAD-splitting (one sub-LOAD per file-backed run between
+/// compressed holes) the demo now ships ~20 entries; 36 leaves
+/// headroom for additional Tier-2 chunks or PT_NOTE smuggling.
+pub const PHDR_TABLE_RESERVE: u64 = 0x800;
+
+/// One file-backed slice of an original PT_LOAD. The writer emits
+/// one [`Elf64Phdr`] of type `PT_LOAD` per `HostRun`. Each run's
+/// `memsz` extends past `file_len` to virtually cover the
+/// compressed hole that follows it (the kernel zero-fills
+/// `[file_len, memsz)`).
+struct HostRun {
+    /// Index into the original `image.phdrs` we inherit flags / align
+    /// from.
+    phdr_template_idx: usize,
+    /// Vaddr where this run begins.
+    vaddr: u64,
+    /// Bytes copied verbatim from the original file.
+    file_len: u64,
+    /// Virtual coverage (== `file_len + zero-fill tail`). Tail
+    /// either covers a compressed hole (mid-LOAD) or the BSS
+    /// portion of the very last run.
+    memsz: u64,
+    /// Source file offset in the *original* image.
+    src_file_off: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -155,57 +177,150 @@ impl<'a> PackedElfBuilder<'a> {
 
     /// Produce the packed ELF bytes.
     pub fn build(self) -> Result<Vec<u8>> {
+        use crate::parse::headers::{PT_DYNAMIC, SHT_NOBITS};
         use crate::parse::relocations::RELA_ENTRY_SIZE;
 
         let raw = &self.image.raw;
-        let _ehdr = &self.image.ehdr;
 
-        // ---- 1. Compute layout ------------------------------------------
-        // The new file starts as a verbatim copy of the original, then
-        // grows. For M1L we keep the original phdr table in place
-        // (ld.so reads from `e_phoff` so we just point it at the new
-        // location after we install one).
+        // ---- 1. Compute "file-backed runs" per original PT_LOAD --------
+        //
+        // A "run" is a contiguous portion of an original PT_LOAD that
+        // we keep backing on disk. Compressed ranges produce holes
+        // *inside* a LOAD; each hole splits the LOAD into runs that
+        // straddle it.
+        //
+        // ld.so requires `(p_vaddr - p_offset) % p_align == 0`; we
+        // honour that by snapping each hole's [start, end) inward to
+        // page boundaries. Bytes between the hole's user-supplied
+        // boundary and the page boundary stay file-backed but get
+        // overwritten with zeros (the stub re-decompresses them at
+        // runtime, so the on-disk content is irrelevant).
+        //
+        // For each original PT_LOAD we end up with one of:
+        //
+        //   * Empty hole list                     => 1 run = the whole LOAD
+        //   * N holes wholly inside the LOAD      => N+1 runs (head + N gaps + tail)
+        //
+        // The first run keeps the original LOAD's filesz/memsz quirk
+        // (e.g. the BSS tail where memsz > filesz). Subsequent
+        // sub-LOADs are pure file-backed (filesz == memsz of their
+        // run), and any final memsz-only tail of the original LOAD
+        // becomes the last sub-LOAD's mem-only padding.
 
-        // File-end and virtual-address-end after the original bytes.
-        let mut file_cursor: u64 = raw.len() as u64;
-        // The highest vaddr end across PT_LOAD segments — we have to
-        // start new LOAD segments above this so vaddrs don't overlap.
-        let mut va_cursor: u64 = self
-            .image
-            .phdrs
-            .iter()
-            .filter(|p| p.p_type == PT_LOAD)
-            .map(|p| p.p_vaddr + p.p_memsz)
-            .max()
-            .ok_or_else(|| anyhow!("no PT_LOAD segments"))?;
+        // Snap a `(vaddr, len)` range inward to page bounds.
+        // Returns None if the snapped range is empty.
+        let snap = |vaddr: u64, len: u64| -> Option<(u64, u64)> {
+            if len == 0 {
+                return None;
+            }
+            let start = align_up(vaddr, PAGE_SIZE);
+            let end = (vaddr + len) & !(PAGE_SIZE - 1);
+            if end > start {
+                Some((start, end - start))
+            } else {
+                None
+            }
+        };
 
-        // Align both cursors up to a 4 KiB boundary so .upobf0's
-        // phdr-relative base sits cleanly. ld.so requires
-        // (vaddr - offset) % p_align == 0 for each LOAD segment.
-        file_cursor = align_up(file_cursor, PAGE_SIZE);
-        va_cursor = align_up(va_cursor, PAGE_SIZE);
-        let page_skew = file_cursor.wrapping_sub(va_cursor) & (PAGE_SIZE - 1);
-        if page_skew != 0 {
-            bail!(
-                "internal: file/vaddr alignment skew ({:#x} vs {:#x})",
-                file_cursor,
-                va_cursor
-            );
+        // Group snapped holes by enclosing PT_LOAD index.
+        let mut holes_per_load: Vec<Vec<(u64, u64)>> =
+            vec![Vec::new(); self.image.phdrs.len()];
+        for (vaddr, len) in &self.compressed_ranges {
+            let Some((sva, slen)) = snap(*vaddr, *len) else { continue };
+            let mut placed = false;
+            for (i, p) in self.image.phdrs.iter().enumerate() {
+                if p.p_type != PT_LOAD {
+                    continue;
+                }
+                if sva >= p.p_vaddr && sva + slen <= p.p_vaddr + p.p_filesz {
+                    holes_per_load[i].push((sva, slen));
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                bail!(
+                    "compressed range vaddr {:#x}+{:#x} (snapped to {:#x}+{:#x}) \
+                     not contained in any PT_LOAD's filesz region",
+                    vaddr, len, sva, slen
+                );
+            }
+        }
+        // Sort + sanity-check no overlaps.
+        for holes in holes_per_load.iter_mut() {
+            holes.sort_by_key(|h| h.0);
+            for w in holes.windows(2) {
+                if w[0].0 + w[0].1 > w[1].0 {
+                    bail!(
+                        "overlapping compressed ranges: {:#x}+{:#x} vs {:#x}+{:#x}",
+                        w[0].0, w[0].1, w[1].0, w[1].1
+                    );
+                }
+            }
         }
 
-        // .upobf0 layout (file order, all aligned to 8 bytes):
+        // ---- 2. Build the new PT_LOAD list (with sub-LOADs) ------------
         //
-        //     +0                    new phdr table (PHDR_TABLE_RESERVE)
-        //     +PHDR_TABLE_RESERVE   stub bytes
+        // For each original PT_LOAD, emit one or more sub-LOADs that
+        // collectively cover the same vaddr range. Holes inside a
+        // sub-LOAD are skipped on disk: we close the current
+        // sub-LOAD at the hole's start, then open a fresh sub-LOAD
+        // immediately after the hole ends. The hole's bytes are
+        // covered by the previous sub-LOAD's `p_memsz`-vs-`p_filesz`
+        // gap (kernel zero-fills the unbacked tail).
         //
-        // .upobf2 (writable, only created when injecting init_array):
+        // To keep ld.so's `(p_vaddr - p_offset) % p_align == 0`
+        // invariant trivially satisfiable, every sub-LOAD past the
+        // first one starts at a page-aligned vaddr (because we
+        // snapped holes inward to page bounds).
         //
-        //     +0                    new init_array (8 * (1+N))
-        //     +init_array_end       new .rela.dyn (24 * (orig + N))
+        // Each entry collected here ends up as one PT_LOAD sub-segment.
+        let mut runs: Vec<HostRun> = Vec::new();
+
+        for (i, p) in self.image.phdrs.iter().enumerate() {
+            if p.p_type != PT_LOAD {
+                continue;
+            }
+            let mut cursor_va = p.p_vaddr;
+            let load_file_end_va = p.p_vaddr + p.p_filesz;
+            let load_mem_end_va = p.p_vaddr + p.p_memsz;
+            for &(hva, hlen) in &holes_per_load[i] {
+                let head_len = hva - cursor_va;
+                runs.push(HostRun {
+                    phdr_template_idx: i,
+                    vaddr: cursor_va,
+                    file_len: head_len,
+                    // Run extends virtually to cover the hole that
+                    // immediately follows so the kernel zero-fills it.
+                    memsz: head_len + hlen,
+                    src_file_off: p.p_offset + (cursor_va - p.p_vaddr),
+                });
+                cursor_va = hva + hlen;
+            }
+            // Final run covers [cursor_va, load_file_end_va) on disk,
+            // plus the BSS tail if any.
+            let tail_file_len = load_file_end_va.saturating_sub(cursor_va);
+            let tail_mem_len = load_mem_end_va.saturating_sub(cursor_va);
+            runs.push(HostRun {
+                phdr_template_idx: i,
+                vaddr: cursor_va,
+                file_len: tail_file_len,
+                memsz: tail_mem_len,
+                src_file_off: p.p_offset + (cursor_va - p.p_vaddr),
+            });
+        }
+
+        // ---- 3. Lay out the output file -------------------------------
         //
-        // .upobf2 must be writable so ld.so can apply
-        // R_X86_64_RELATIVE relocations onto the init_array slots
-        // before invoking them.
+        // Phase 1: ELF header + new phdr table at file offset 0.
+        // Phase 2: each HostRun packed sequentially with page skew.
+        // Phase 3: stub (.upobf0), upobf2 (init_array+rela), upobf1 (payload).
+        //
+        // We need to know the phdr count up front to reserve the
+        // header region. Total = HostRuns + .upobf0 + maybe .upobf2 +
+        // maybe .upobf1 + every non-LOAD phdr from the original (PHDR/
+        // INTERP/DYNAMIC/NOTE/TLS/GNU_*).
+
         let stub_bytes = self.stub.as_deref().unwrap_or(&[]);
         let init_array_va = self.image.dynamic.as_ref()
             .and_then(|d| d.init_array);
@@ -214,17 +329,11 @@ impl<'a> PackedElfBuilder<'a> {
             .unwrap_or(0);
         let host_init_count = (init_array_size / 8) as usize;
 
-        // Derive the relocation table layout. We always rebuild
-        // .rela.dyn end-to-end when injecting init_array so the
-        // RELACOUNT prefix invariant (RELATIVE entries first) stays
-        // intact.
         let new_rela_entries: Vec<RelaWrite> = if self.inject_init_array {
             collect_rela_for_init_redirect(self.image, host_init_count)?
         } else {
             Vec::new()
         };
-
-        // Sizes of the writable trailing block (.upobf2).
         let new_init_array_bytes_len: u64 = if self.inject_init_array {
             8 * (1 + host_init_count as u64)
         } else {
@@ -233,17 +342,9 @@ impl<'a> PackedElfBuilder<'a> {
         let new_rela_bytes_len: u64 =
             new_rela_entries.len() as u64 * RELA_ENTRY_SIZE as u64;
 
-        // .upobf0 size: phdr reserve + stub bytes (page-aligned).
         let stub_off_in_upobf0 = PHDR_TABLE_RESERVE;
         let upobf0_size = align_up(stub_off_in_upobf0 + stub_bytes.len() as u64, PAGE_SIZE);
 
-        let upobf0_file_off = file_cursor;
-        let upobf0_vaddr = va_cursor;
-        file_cursor += upobf0_size;
-        va_cursor += upobf0_size;
-
-        // .upobf2 (R+W): init_array + .rela.dyn. Only present when
-        // injecting init_array.
         let init_array_off_in_upobf2: u64 = 0;
         let rela_off_in_upobf2: u64 = align_up(new_init_array_bytes_len, 8);
         let upobf2_inner_end = rela_off_in_upobf2 + new_rela_bytes_len;
@@ -253,59 +354,173 @@ impl<'a> PackedElfBuilder<'a> {
         } else {
             0
         };
-        let upobf2_file_off = file_cursor;
-        let upobf2_vaddr = va_cursor;
-        if have_upobf2 {
-            file_cursor += upobf2_size;
-            va_cursor += upobf2_size;
-        }
 
-        // .upobf1 layout: payload bytes (if any).
         let payload_bytes = self.payload.as_deref().unwrap_or(&[]);
         let upobf1_size: u64 = align_up(payload_bytes.len() as u64, PAGE_SIZE).max(PAGE_SIZE);
-        let upobf1_file_off = file_cursor;
-        let upobf1_vaddr = va_cursor;
         let have_upobf1 = !payload_bytes.is_empty();
-        if have_upobf1 {
-            file_cursor += upobf1_size;
-            let _ = va_cursor + upobf1_size;
-        }
 
-        // ---- 2. Build new phdr table ------------------------------------
-        // Original phdrs first, with PT_PHDR rewritten (and the LOAD
-        // segment that contained it potentially expanded — we keep
-        // it byte-for-byte and instead point PT_PHDR at the relocated
-        // copy inside .upobf0).
-        let mut new_phdrs: Vec<Elf64Phdr> = self.image.phdrs.clone();
+        // ---- Allocate vaddrs for appended segments --------------------
+        let mut va_cursor: u64 = self
+            .image
+            .phdrs
+            .iter()
+            .filter(|p| p.p_type == PT_LOAD)
+            .map(|p| p.p_vaddr + p.p_memsz)
+            .max()
+            .ok_or_else(|| anyhow!("no PT_LOAD segments"))?;
+        va_cursor = align_up(va_cursor, PAGE_SIZE);
 
-        let final_phnum: u64 = (new_phdrs.len() as u64)
-            + 1u64                                    // .upobf0
-            + (have_upobf2 as u64)                    // .upobf2
-            + (have_upobf1 as u64);                   // .upobf1
+        let upobf0_vaddr = va_cursor;
+        va_cursor += upobf0_size;
+        let upobf2_vaddr = va_cursor;
+        if have_upobf2 { va_cursor += upobf2_size; }
+        let upobf1_vaddr = va_cursor;
+        if have_upobf1 { va_cursor += upobf1_size; }
+        let _ = va_cursor; // unused after this point
+
+        // ---- Count phdrs to figure header size ------------------------
+        // All original non-LOAD phdrs + N HostRuns + .upobf0 +
+        // .upobf2? + .upobf1?
+        let non_load_phdr_count = self.image.phdrs
+            .iter()
+            .filter(|p| p.p_type != PT_LOAD)
+            .count();
+        let final_phnum: u64 = (non_load_phdr_count as u64)
+            + (runs.len() as u64)
+            + 1u64
+            + (have_upobf2 as u64)
+            + (have_upobf1 as u64);
         let phdr_table_bytes = final_phnum * PHDR64_SIZE as u64;
         if phdr_table_bytes > PHDR_TABLE_RESERVE {
             bail!(
-                "new phdr table {} bytes overflows reserve {} bytes — bump PHDR_TABLE_RESERVE",
-                phdr_table_bytes,
-                PHDR_TABLE_RESERVE
+                "new phdr table {} bytes ({} entries) overflows reserve {} bytes — bump PHDR_TABLE_RESERVE",
+                phdr_table_bytes, final_phnum, PHDR_TABLE_RESERVE
             );
         }
 
-        // Rewrite original PT_PHDR (if present) to cover the relocated
-        // table. The phdr table now lives at the *start* of .upobf0,
-        // which is at upobf0_vaddr / upobf0_file_off.
-        for p in new_phdrs.iter_mut() {
-            if p.p_type == PT_PHDR {
-                p.p_offset = upobf0_file_off;
-                p.p_vaddr = upobf0_vaddr;
-                p.p_paddr = upobf0_vaddr;
-                p.p_filesz = phdr_table_bytes;
-                p.p_memsz = phdr_table_bytes;
-                p.p_align = 8;
+        // ---- File-offset assignment ------------------------------------
+        //
+        // Strategy: keep the ELF header + main phdr table at file
+        // offset 0 (mirrors how every linker lays things out). The
+        // first HostRun normally starts at vaddr 0 (the read-only
+        // ELF header LOAD), so its file offset can be 0 too —
+        // satisfying `(vaddr - offset) % page == 0`. We just need
+        // the file portion of that first run to be large enough to
+        // contain the rebuilt phdr table (it usually is — the
+        // original first LOAD covers ~10 MiB of headers + .rodata).
+        //
+        // For subsequent runs, we advance the file cursor with page
+        // skew matching the run's vaddr. This ensures
+        // `(p_vaddr - p_offset) & 0xFFF == 0` on every sub-LOAD.
+
+        // Helper: bump file cursor to satisfy page skew == vaddr & 0xfff.
+        let align_file_for_vaddr = |cur: u64, vaddr: u64| -> u64 {
+            let target_skew = vaddr & (PAGE_SIZE - 1);
+            let cur_skew = cur & (PAGE_SIZE - 1);
+            if cur_skew == target_skew {
+                cur
+            } else if cur_skew < target_skew {
+                cur + (target_skew - cur_skew)
+            } else {
+                cur + (PAGE_SIZE - cur_skew) + target_skew
             }
+        };
+
+        let mut run_file_offsets: Vec<u64> = Vec::with_capacity(runs.len());
+        let mut file_cursor: u64 = 0;
+        for r in &runs {
+            file_cursor = align_file_for_vaddr(file_cursor, r.vaddr);
+            run_file_offsets.push(file_cursor);
+            file_cursor += r.file_len;
+        }
+        // Page-align before appended segments so subsequent LOAD
+        // p_offsets stay clean.
+        file_cursor = align_up(file_cursor, PAGE_SIZE);
+
+        let upobf0_file_off = align_file_for_vaddr(file_cursor, upobf0_vaddr);
+        file_cursor = upobf0_file_off + upobf0_size;
+        let upobf2_file_off = if have_upobf2 {
+            let f = align_file_for_vaddr(file_cursor, upobf2_vaddr);
+            file_cursor = f + upobf2_size;
+            f
+        } else { 0 };
+        let upobf1_file_off = if have_upobf1 {
+            let f = align_file_for_vaddr(file_cursor, upobf1_vaddr);
+            file_cursor = f + upobf1_size;
+            f
+        } else { 0 };
+
+        let total_file_len = file_cursor;
+
+        // ---- 4. Build the new phdr table -------------------------------
+        let mut new_phdrs: Vec<Elf64Phdr> = Vec::with_capacity(final_phnum as usize);
+
+        // (a) HostRun sub-LOADs (one per run).
+        for (i, r) in runs.iter().enumerate() {
+            let template = &self.image.phdrs[r.phdr_template_idx];
+            new_phdrs.push(Elf64Phdr {
+                p_type: PT_LOAD,
+                p_flags: template.p_flags,
+                p_offset: run_file_offsets[i],
+                p_vaddr: r.vaddr,
+                p_paddr: r.vaddr,
+                p_filesz: r.file_len,
+                p_memsz: r.memsz,
+                p_align: template.p_align.max(PAGE_SIZE),
+            });
         }
 
-        // Append PT_LOAD .upobf0 (R+X)
+        // (b) Original non-LOAD phdrs, with file offsets re-mapped
+        //     through the LOAD layout (vaddr stays put, file offset
+        //     follows the new run that contains the vaddr).
+        //
+        // PT_PHDR is a special case: it points at the new phdr
+        // table at file offset 0 (or wherever we put it). We rewrite
+        // it explicitly so a stale offset can't bite ld.so.
+        let vaddr_to_new_file_off = |va: u64| -> Option<u64> {
+            for (i, r) in runs.iter().enumerate() {
+                if va >= r.vaddr && va < r.vaddr + r.file_len {
+                    return Some(run_file_offsets[i] + (va - r.vaddr));
+                }
+            }
+            None
+        };
+        for p in &self.image.phdrs {
+            if p.p_type == PT_LOAD {
+                continue;
+            }
+            let mut q = p.clone();
+            if q.p_type == PT_PHDR {
+                // We'll relocate PT_PHDR to point at the rebuilt
+                // table inside .upobf0 below; for now park it at
+                // the .upobf0 head.
+                q.p_offset = upobf0_file_off;
+                q.p_vaddr = upobf0_vaddr;
+                q.p_paddr = upobf0_vaddr;
+                q.p_filesz = phdr_table_bytes;
+                q.p_memsz = phdr_table_bytes;
+                q.p_align = 8;
+            } else if q.p_filesz > 0 {
+                // Look up the file offset via the run map. Some
+                // entries (e.g. PT_TLS pointing at .tdata + .tbss)
+                // span both file-backed and BSS; we anchor on the
+                // start vaddr.
+                if let Some(new_off) = vaddr_to_new_file_off(q.p_vaddr) {
+                    q.p_offset = new_off;
+                } else {
+                    bail!(
+                        "non-LOAD phdr {:?} vaddr {:#x} not covered by any run",
+                        q.type_name(), q.p_vaddr
+                    );
+                }
+            }
+            // PT_DYNAMIC special: writer rewrites .dynamic in place
+            // later, file offset just needs to follow vaddr.
+            let _ = PT_DYNAMIC;
+            new_phdrs.push(q);
+        }
+
+        // (c) .upobf0 LOAD (R+X) — also hosts the rebuilt phdr table.
         new_phdrs.push(Elf64Phdr {
             p_type: PT_LOAD,
             p_flags: PF_R | PF_X,
@@ -316,8 +531,6 @@ impl<'a> PackedElfBuilder<'a> {
             p_memsz: upobf0_size,
             p_align: PAGE_SIZE,
         });
-
-        // Append PT_LOAD .upobf2 (R+W) if present
         if have_upobf2 {
             new_phdrs.push(Elf64Phdr {
                 p_type: PT_LOAD,
@@ -330,13 +543,6 @@ impl<'a> PackedElfBuilder<'a> {
                 p_align: PAGE_SIZE,
             });
         }
-
-        // Append PT_LOAD .upobf1 (if any). Note `p_filesz == p_memsz`
-        // == upobf1_size so the kernel can mmap the full segment in
-        // one shot — small unaligned `p_filesz` (especially when
-        // `p_filesz` < a page) trips the kernel's ELF loader on
-        // some configurations and fails the entire execve with
-        // EFAULT.
         if have_upobf1 {
             new_phdrs.push(Elf64Phdr {
                 p_type: PT_LOAD,
@@ -349,68 +555,44 @@ impl<'a> PackedElfBuilder<'a> {
                 p_align: PAGE_SIZE,
             });
         }
-
         debug_assert_eq!(new_phdrs.len() as u64, final_phnum);
 
-        // ---- 3. Materialise output buffer -------------------------------
-        let mut out = vec![0u8; file_cursor as usize];
-        out[..raw.len()].copy_from_slice(raw);
+        // ---- 5. Materialise output buffer ------------------------------
+        let mut out = vec![0u8; total_file_len as usize];
 
-        // Zero out compressed ranges in the host portion. The kernel
-        // maps zero pages at those vaddrs at run time; the stub
-        // mprotect(RW) -> writes decompressed bytes -> restores
-        // original protection. We translate vaddr ranges to file
-        // offsets via the original image's PT_LOAD walk.
-        for (vaddr, len) in &self.compressed_ranges {
-            if *len == 0 {
+        // Copy ELF header from the original (offset 0..0x40).
+        out[..64].copy_from_slice(&raw[..64]);
+
+        // Copy each HostRun's bytes verbatim from the original.
+        for (i, r) in runs.iter().enumerate() {
+            if r.file_len == 0 {
                 continue;
             }
-            let file_off = self
-                .image
-                .vaddr_to_file_offset(*vaddr)
-                .with_context(|| {
-                    format!("compressed range vaddr {:#x} -> file off", vaddr)
-                })?;
-            let end = (file_off + len) as usize;
-            if end > raw.len() {
+            let src = r.src_file_off as usize;
+            let dst = run_file_offsets[i] as usize;
+            let n = r.file_len as usize;
+            if src + n > raw.len() {
                 bail!(
-                    "compressed range past EOF: file 0x{:X}+0x{:X} > 0x{:X}",
-                    file_off, len, raw.len()
+                    "run src past EOF: {:#x}+{:#x} > {:#x}",
+                    src, n, raw.len()
                 );
             }
-            for b in &mut out[file_off as usize..end] {
-                *b = 0;
-            }
+            out[dst..dst + n].copy_from_slice(&raw[src..src + n]);
         }
 
-        // Write the new phdr table into .upobf0 head.
-        write_phdr_table(
-            &mut out,
-            upobf0_file_off as usize,
-            &new_phdrs,
-        )?;
-
-        // Stub bytes follow the phdr reserve.
+        // Stub bytes follow the phdr reserve inside .upobf0.
         if !stub_bytes.is_empty() {
             let stub_off = (upobf0_file_off + stub_off_in_upobf0) as usize;
             out[stub_off..stub_off + stub_bytes.len()].copy_from_slice(stub_bytes);
         }
 
-        // Compute final vaddrs for the new init_array / .rela.dyn
-        // (they live in .upobf2 when injection is enabled).
+        // .upobf2 (init_array + rela) materialisation.
         let new_init_array_vaddr = upobf2_vaddr + init_array_off_in_upobf2;
         let new_rela_vaddr = upobf2_vaddr + rela_off_in_upobf2;
-
-        // Build init_array bytes now that we know the slot 0 vaddr.
         if self.inject_init_array {
             let stub_init_va: u64 = upobf0_vaddr + PHDR_TABLE_RESERVE + self.stub_init_offset;
             let off = (upobf2_file_off + init_array_off_in_upobf2) as usize;
-            // Slot 0: stub init function VA. (ld.so will apply
-            // R_X86_64_RELATIVE on top via the new .rela.dyn entry
-            // we emit below — value in file == link-time addr; ld.so
-            // adds load slide.)
             out[off..off + 8].copy_from_slice(&stub_init_va.to_le_bytes());
-            // Slots 1..=N: copy original .init_array entries verbatim.
             if let Some(init_va) = init_array_va {
                 let src_off = self.image.vaddr_to_file_offset(init_va)
                     .context("DT_INIT_ARRAY -> file offset")? as usize;
@@ -418,34 +600,22 @@ impl<'a> PackedElfBuilder<'a> {
                 if src_off + copy_len > raw.len() {
                     bail!(
                         ".init_array past EOF: {:#x}+{:#x} > {:#x}",
-                        src_off,
-                        copy_len,
-                        raw.len()
+                        src_off, copy_len, raw.len()
                     );
                 }
                 out[off + 8..off + 8 + copy_len]
                     .copy_from_slice(&raw[src_off..src_off + copy_len]);
             }
         }
-
-        // ---- 4. Materialise the new .rela.dyn ---------------------------
         if self.inject_init_array && !new_rela_entries.is_empty() {
             let off = (upobf2_file_off + rela_off_in_upobf2) as usize;
             for (i, e) in new_rela_entries.iter().enumerate() {
                 let entry_off = off + i * RELA_ENTRY_SIZE;
-                // For our newly-introduced stub-init RELATIVE entry
-                // we have to fill the r_offset (vaddr of slot 0)
-                // and r_addend (link-time stub init VA) here, since
-                // the layout vaddrs were unknown when collect_*
-                // ran.
                 let (r_offset, r_addend) = if e.is_stub_slot {
                     let stub_init_va =
                         upobf0_vaddr + PHDR_TABLE_RESERVE + self.stub_init_offset;
                     (new_init_array_vaddr, stub_init_va as i64)
                 } else if e.is_old_init_slot {
-                    // Rewrite r_offset from old init_array slot to
-                    // the new slot. We slot index is encoded in
-                    // r_addend_extra so we can compute new vaddr.
                     let new_offset = new_init_array_vaddr + 8 + 8 * e.old_slot_idx as u64;
                     (new_offset, e.original_addend)
                 } else {
@@ -460,29 +630,116 @@ impl<'a> PackedElfBuilder<'a> {
             }
         }
 
-        // Payload bytes go into .upobf1.
+        // Payload bytes.
         if have_upobf1 {
             let off = upobf1_file_off as usize;
             out[off..off + payload_bytes.len()].copy_from_slice(payload_bytes);
         }
 
-        // ---- 5. Patch ELF header ----------------------------------------
-        // e_phoff -> upobf0_file_off
+        // Write the new phdr table at the head of .upobf0.
+        write_phdr_table(&mut out, upobf0_file_off as usize, &new_phdrs)?;
+
+        // ---- 6. Patch section header table -----------------------------
+        //
+        // Section headers are not consumed by ld.so but `readelf`
+        // and gdb will choke if their `sh_offset` no longer
+        // matches the actual file location. We:
+        //   * Move the shdr table to the very end of the file.
+        //   * Update each non-NOBITS shdr's `sh_offset` via the
+        //     vaddr->new-offset map. NOBITS sections keep their
+        //     original (irrelevant) offset — convention.
+        //   * Update the ELF header's `e_shoff` accordingly.
+        let mut shdr_table = Vec::with_capacity(self.image.shdrs.len() * SHDR64_SIZE);
+        for s in &self.image.shdrs {
+            let mut sh_offset = s.sh_offset;
+            if s.sh_type != SHT_NOBITS && s.sh_addr != 0 {
+                if let Some(new_off) = vaddr_to_new_file_off(s.sh_addr) {
+                    sh_offset = new_off;
+                }
+            }
+            // Sections without an addr (.symtab, .strtab, .shstrtab,
+            // .comment, .debug_*) live in regions of the original
+            // file we may have moved. We do a best-effort fixup:
+            // if the original offset falls inside any HostRun's
+            // src window, redirect it to the same offset in the
+            // new file.
+            if s.sh_addr == 0 && s.sh_type != SHT_NOBITS && s.sh_size > 0 {
+                for (i, r) in runs.iter().enumerate() {
+                    if r.file_len == 0 { continue; }
+                    if s.sh_offset >= r.src_file_off
+                        && s.sh_offset + s.sh_size <= r.src_file_off + r.file_len
+                    {
+                        sh_offset = run_file_offsets[i] + (s.sh_offset - r.src_file_off);
+                        break;
+                    }
+                }
+            }
+            let mut entry = [0u8; SHDR64_SIZE];
+            LittleEndian::write_u32(&mut entry[0..4], s.sh_name);
+            LittleEndian::write_u32(&mut entry[4..8], s.sh_type);
+            LittleEndian::write_u64(&mut entry[8..16], s.sh_flags);
+            LittleEndian::write_u64(&mut entry[16..24], s.sh_addr);
+            LittleEndian::write_u64(&mut entry[24..32], sh_offset);
+            LittleEndian::write_u64(&mut entry[32..40], s.sh_size);
+            LittleEndian::write_u32(&mut entry[40..44], s.sh_link);
+            LittleEndian::write_u32(&mut entry[44..48], s.sh_info);
+            LittleEndian::write_u64(&mut entry[48..56], s.sh_addralign);
+            LittleEndian::write_u64(&mut entry[56..64], s.sh_entsize);
+            shdr_table.extend_from_slice(&entry);
+        }
+        // Append the new shdr table.
+        let new_shoff = total_file_len;
+        out.extend_from_slice(&shdr_table);
+        // Also append the unmapped .symtab/.strtab/.shstrtab/etc.
+        // payloads — but only those we couldn't relocate via runs.
+        // Simpler approach: append the original shdr-only sections
+        // verbatim if they couldn't be mapped.
+        let mut tail_offsets: std::collections::HashMap<usize, u64> =
+            std::collections::HashMap::new();
+        for (idx, s) in self.image.shdrs.iter().enumerate() {
+            if s.sh_addr != 0 || s.sh_type == SHT_NOBITS || s.sh_size == 0 {
+                continue;
+            }
+            let mut covered = false;
+            for r in &runs {
+                if r.file_len == 0 { continue; }
+                if s.sh_offset >= r.src_file_off
+                    && s.sh_offset + s.sh_size <= r.src_file_off + r.file_len
+                {
+                    covered = true;
+                    break;
+                }
+            }
+            if covered { continue; }
+            // Append.
+            let off = out.len() as u64;
+            let src = s.sh_offset as usize;
+            let n = s.sh_size as usize;
+            if src + n > raw.len() {
+                continue;
+            }
+            out.extend_from_slice(&raw[src..src + n]);
+            tail_offsets.insert(idx, off);
+        }
+        // Rewrite shdr table entries for the appended sections.
+        for (idx, new_off) in &tail_offsets {
+            let entry_off = new_shoff as usize + idx * SHDR64_SIZE;
+            LittleEndian::write_u64(&mut out[entry_off + 24..entry_off + 32], *new_off);
+        }
+
+        // ---- 7. Patch ELF header ---------------------------------------
+        // e_phoff -> upobf0_file_off; e_phnum -> final_phnum;
+        // e_shoff -> new_shoff; e_shnum unchanged.
         LittleEndian::write_u64(&mut out[0x20..0x28], upobf0_file_off);
         LittleEndian::write_u16(&mut out[0x38..0x3A], final_phnum as u16);
+        LittleEndian::write_u64(&mut out[0x28..0x30], new_shoff);
 
-        // Phase I: e_entry redirect. The ELF header's e_entry field
-        // (at offset 0x18, 8 bytes) is rewritten so the kernel
-        // transfers control to the stub's trampoline first. The
-        // trampoline runs `upobf_stub_init` (decompresses
-        // .text + everything else) then jumps to the host's
-        // original entry point.
         if let Some(tramp_off) = self.entry_trampoline_offset {
             let tramp_va = upobf0_vaddr + PHDR_TABLE_RESERVE + tramp_off;
             LittleEndian::write_u64(&mut out[0x18..0x20], tramp_va);
         }
 
-        // ---- 6. Patch .dynamic -----------------------------------------
+        // ---- 8. Patch .dynamic ----------------------------------------
         if self.inject_init_array {
             patch_dynamic(
                 &mut out,
@@ -492,6 +749,8 @@ impl<'a> PackedElfBuilder<'a> {
                 new_rela_vaddr,
                 new_rela_bytes_len,
                 count_relative_prefix(&new_rela_entries) as u64,
+                &runs,
+                &run_file_offsets,
             )?;
         }
 
@@ -668,7 +927,9 @@ fn count_relative_prefix(entries: &[RelaWrite]) -> usize {
 
 /// Rewrite the `DT_INIT_ARRAY`, `DT_INIT_ARRAYSZ`, `DT_RELA`,
 /// `DT_RELASZ`, and `DT_RELACOUNT` entries inside `.dynamic` in
-/// place to point at the new arrays.
+/// place to point at the new arrays. `runs` + `run_file_offsets`
+/// are needed so we can locate the new file offset of `.dynamic`
+/// after host-run repacking.
 fn patch_dynamic(
     out: &mut [u8],
     image: &crate::ElfImage,
@@ -677,6 +938,8 @@ fn patch_dynamic(
     new_rela_va: u64,
     new_rela_sz: u64,
     new_relacount: u64,
+    runs: &[HostRun],
+    run_file_offsets: &[u64],
 ) -> Result<()> {
     use crate::parse::dynamic::{
         DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_RELA, DT_RELACOUNT, DT_RELASZ, DT_ENTRY_SIZE,
@@ -687,7 +950,27 @@ fn patch_dynamic(
         .as_ref()
         .ok_or_else(|| anyhow!("dynamic patch requires PT_DYNAMIC"))?;
 
-    let base_off = dyn_info.file_offset as usize;
+    // The original .dynamic's file offset is no longer valid in the
+    // repacked output; locate the new one via the run map.
+    // Vaddr comes from the PT_DYNAMIC phdr (DynamicInfo only stores
+    // the original file offset).
+    let dyn_vaddr = image.phdrs
+        .iter()
+        .find(|p| p.p_type == crate::parse::headers::PT_DYNAMIC)
+        .map(|p| p.p_vaddr)
+        .ok_or_else(|| anyhow!("PT_DYNAMIC phdr missing"))?;
+    let mut new_base_off: Option<u64> = None;
+    for (i, r) in runs.iter().enumerate() {
+        if r.file_len == 0 { continue; }
+        if dyn_vaddr >= r.vaddr && dyn_vaddr < r.vaddr + r.file_len {
+            new_base_off = Some(run_file_offsets[i] + (dyn_vaddr - r.vaddr));
+            break;
+        }
+    }
+    let base_off = new_base_off
+        .ok_or_else(|| anyhow!("dynamic vaddr {:#x} not in any host run", dyn_vaddr))?
+        as usize;
+
     for (i, entry) in dyn_info.raw.iter().enumerate() {
         let entry_off = base_off + i * DT_ENTRY_SIZE;
         match entry.tag {
@@ -735,10 +1018,10 @@ mod tests {
     }
 
     #[test]
-    fn phdr_reserve_holds_eighteen_entries() {
-        // 18 phdrs * 56 bytes == 1008 < 1024.
-        assert!(18 * PHDR64_SIZE as u64 <= PHDR_TABLE_RESERVE);
-        // 19 phdrs would not fit.
-        assert!(19 * PHDR64_SIZE as u64 > PHDR_TABLE_RESERVE);
+    fn phdr_reserve_holds_thirtysix_entries() {
+        // 36 phdrs * 56 bytes == 2016 < 2048.
+        assert!(36 * PHDR64_SIZE as u64 <= PHDR_TABLE_RESERVE);
+        // 37 phdrs would not fit.
+        assert!(37 * PHDR64_SIZE as u64 > PHDR_TABLE_RESERVE);
     }
 }
