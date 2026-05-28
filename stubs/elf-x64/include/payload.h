@@ -55,30 +55,33 @@ extern "C" {
 // ---------------------------------------------------------------------
 // API table indices (fixed order from the protocol).
 //
-// Phase G: 9 entries; the first two are anchor APIs that remain in the
-// packed PE's import table, the rest are looked up at runtime via
-// `GetProcAddress`. Phase F adds three more (CreateThread / Sleep /
-// CloseHandle) for the background CRC watchdog thread, all resolved
-// dynamically. The two anchor APIs are still the only ones whose
-// names appear in IAT-visible memory.
+// ELF flavour. Unlike the PE side (which uses GetModuleHandleW +
+// GetProcAddress as anchors that survive in the IAT), the ELF stub
+// resolves libc.so.6's base by parsing /proc/self/maps with raw
+// openat/read syscalls, then walks the libc PT_DYNAMIC →
+// DT_GNU_HASH + DT_SYMTAB + DT_STRTAB to look up each function by
+// name. As a result UPOBF_API_ANCHOR_COUNT is 0: no symbol from this
+// table needs to live in the packed binary's dynamic linkage.
+//
+// All 8 entries resolve at run time. The set covers what Phase F
+// (CRC watchdog) and Phase I (OEP redirect) need; mmap/mprotect/munmap
+// duplicate functionality the stub already has via raw syscalls so
+// downstream phases can choose either path without redoing the
+// resolver.
 // ---------------------------------------------------------------------
 enum {
-    UPOBF_API_GET_MODULE_HANDLE_W = 0, // anchor (wide)
-    UPOBF_API_GET_PROC_ADDRESS    = 1, // anchor
-    UPOBF_API_VIRTUAL_PROTECT     = 2,
-    UPOBF_API_VIRTUAL_ALLOC       = 3,
-    UPOBF_API_VIRTUAL_FREE        = 4,
-    UPOBF_API_IS_DEBUGGER_PRESENT = 5,
-    UPOBF_API_GET_CURRENT_PROCESS = 6,
-    UPOBF_API_GET_CURRENT_THREAD  = 7,
-    UPOBF_API_GET_THREAD_CONTEXT  = 8,
-    UPOBF_API_CREATE_THREAD       = 9,  // watchdog
-    UPOBF_API_SLEEP               = 10, // watchdog
-    UPOBF_API_CLOSE_HANDLE        = 11, // watchdog
-    UPOBF_API_COUNT               = 12,
+    UPOBF_API_PTHREAD_CREATE = 0,  // F watchdog
+    UPOBF_API_PTHREAD_DETACH = 1,  // F watchdog (replaces CloseHandle)
+    UPOBF_API_NANOSLEEP      = 2,  // F watchdog (replaces Sleep)
+    UPOBF_API_CLOCK_GETTIME  = 3,  // F timing
+    UPOBF_API_MMAP           = 4,  // I OEP install (libc shim)
+    UPOBF_API_MPROTECT       = 5,  // I OEP install (libc shim)
+    UPOBF_API_MUNMAP         = 6,  // I OEP install (libc shim)
+    UPOBF_API_PRCTL          = 7,  // anti-coredump (PR_SET_DUMPABLE)
+    UPOBF_API_COUNT          = 8,
 };
 
-#define UPOBF_API_ANCHOR_COUNT 2u
+#define UPOBF_API_ANCHOR_COUNT 0u
 
 // ---------------------------------------------------------------------
 // Fixed nonce salt for the API string table.

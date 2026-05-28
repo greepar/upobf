@@ -25,6 +25,7 @@
 
 #include "stub_runtime.h"
 #include "payload.h"
+#include "api_resolve.h"
 
 // ---------------------------------------------------------------------
 // Forward decls of the cross-platform crypto / compression / filter
@@ -298,4 +299,40 @@ void upobf_stub_init(void) {
 
     upobf_munmap(arena_base, arena_len);
     upobf_munmap(scratch, scratch_len);
+
+    // ------------------------------------------------------------------
+    // Phase G: resolve libc API table.
+    //
+    // Done AFTER chunk decode so any decrypted payload sections that
+    // need protection are already in place; the resolver only reads
+    // /proc/self/maps + libc's already-mapped pages.
+    //
+    // The result feeds Phases F (pthread CRC watchdog) and I (OEP
+    // redirect). Even with neither wired in yet, we run the resolver
+    // here so a build regression in Phase G surfaces as visible
+    // breakage at the e2e level (the resolver wipes the API string
+    // table so even a no-op consumer is observable in /proc/<pid>/maps
+    // pressure tests).
+    //
+    // We deliberately ignore failure: a resolver miss leaves Phases
+    // F/I disabled but doesn't keep Avalonia from running. The
+    // anti-coredump prctl below is the one immediate consumer.
+    // ------------------------------------------------------------------
+    ResolvedApis apis = { 0 };
+    if (upobf_resolve_apis(ph, &apis) && apis.prctl) {
+        // PR_SET_DUMPABLE = 4. Setting it to 0 turns off ptrace
+        // attach + core dump generation for this process. Subsequent
+        // Phase F/I install steps will be added below this line in
+        // future commits.
+        const int UPOBF_PR_SET_DUMPABLE = 4;
+        apis.prctl(UPOBF_PR_SET_DUMPABLE, 0u, 0u, 0u, 0u);
+    }
+
+    // Wipe the local ResolvedApis. Future phases (F watchdog, I OEP
+    // install) will own a heap-allocated copy that survives this
+    // function; for M4L Phase G alone we don't keep state.
+    {
+        volatile uint8_t *zb = (volatile uint8_t *)&apis;
+        for (size_t k = 0; k < sizeof(apis); k++) zb[k] = 0;
+    }
 }

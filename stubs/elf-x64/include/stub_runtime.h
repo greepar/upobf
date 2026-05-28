@@ -147,6 +147,13 @@ static inline int upobf_open_proc_status(void) {
     return (int)upobf_syscall3(UPOBF_SYS_openat, AT_FDCWD, (long)path, O_RDONLY);
 }
 
+// Generic openat(AT_FDCWD, path, O_RDONLY). Used by the API
+// resolver (Phase G) to read /proc/self/maps without baking that
+// exact string in this header.
+static inline int upobf_openat_rdonly(const char *path) {
+    return (int)upobf_syscall3(UPOBF_SYS_openat, AT_FDCWD, (long)path, O_RDONLY);
+}
+
 static inline long upobf_read(int fd, void *buf, size_t len) {
     return upobf_syscall3(UPOBF_SYS_read, fd, (long)buf, (long)len);
 }

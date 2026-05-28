@@ -708,21 +708,22 @@ fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
 }
 
-/// API table the ELF stub will reference at runtime. M3L doesn't
-/// actually consume this (the stub runs without dlsym), but the
-/// payload builder requires a non-empty list to encode the header
-/// slot — we emit a Linux-flavoured set so the names look natural
-/// in case anyone scans the encrypted blob's pre-decryption length.
+/// API table the ELF stub references at runtime (Phase G).
+///
+/// Order MUST match `enum UPOBF_API_*` in
+/// `stubs/elf-x64/include/payload.h` and the slot fill-in in
+/// `stubs/elf-x64/src/api_resolve.c::upobf_resolve_apis`. The stub
+/// looks each function up by name in libc.so.6 via the GNU hash
+/// table; the module name is decorative (validated for shape only).
 const ELF_API_NAMES: &[(&str, &str)] = &[
-    ("libc.so.6", "mmap"),
-    ("libc.so.6", "mprotect"),
-    ("libc.so.6", "munmap"),
-    ("libc.so.6", "openat"),
-    ("libc.so.6", "read"),
-    ("libc.so.6", "close"),
-    ("libc.so.6", "ptrace"),
-    ("libc.so.6", "clock_gettime"),
-    ("libc.so.6", "exit"),
+    ("libc.so.6", "pthread_create"),  // 0  Phase F watchdog
+    ("libc.so.6", "pthread_detach"),  // 1  Phase F watchdog
+    ("libc.so.6", "nanosleep"),       // 2  Phase F watchdog
+    ("libc.so.6", "clock_gettime"),   // 3  timing
+    ("libc.so.6", "mmap"),            // 4  Phase I OEP install
+    ("libc.so.6", "mprotect"),        // 5  Phase I OEP install
+    ("libc.so.6", "munmap"),          // 6  Phase I OEP install
+    ("libc.so.6", "prctl"),           // 7  anti-coredump
 ];
 
 /// Compute the .upobf0 vaddr the writer will pick. Mirrors the
