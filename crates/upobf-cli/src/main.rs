@@ -504,28 +504,28 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
 
     // ---- Classify candidate sections -----------------------------------
     //
-    // M3L scope: only sections whose bytes are NOT touched between
-    // `e_entry` (= host `_start`, in `.text`) and the moment our
-    // init_array hook fires. That excludes `.text` itself: zeroing
-    // it would crash the host before our stub runs (the kernel
-    // jumps to `_start` directly).
+    // Two-tier strategy:
+    //   1. Tier-1 candidates (whole-section): sections that ld.so /
+    //      libgcc / the C runtime never touch before init_array runs.
+    //      Right now: __managedcode, __unbox (NativeAOT JIT'd code,
+    //      only consumed by the .NET CLR after boot).
+    //   2. Tier-2 candidates (page-level safe runs): sections whose
+    //      forbidden ranges (covered by `layout::safe_ranges`) we
+    //      intersect against. Right now: .rodata, .dotnet_eh_table,
+    //      .data.rel.ro after init.
     //
-    // Safe candidates:
-    //   * `__managedcode` — NativeAOT JIT'd code, only used after
-    //     the .NET CLR boots, well after init_array.
-    //   * `__unbox` — same story.
-    //
-    // .rodata / .data.rel.ro / .data require forbidden-range
-    // coalescing (Phase E proper); deferred to M4L where we
-    // mirror the PE side's safe_runs_in_section pipeline.
-    //
-    // .text + OEP-redirect lands in M4L Phase I.
+    // .text + OEP-redirect lands in Phase I. .data is too dynamic
+    // (pthread tables / TLS templates) to compress safely.
     let mut chunk_inputs: Vec<PayloadInput> = Vec::new();
     let mut compressed_ranges: Vec<(u64, u64)> = Vec::new();
 
     if !no_compress && stub_blob.is_some() {
-        const COMPRESS_CANDIDATES: &[&str] = &["__managedcode", "__unbox"];
-        for sec_name in COMPRESS_CANDIDATES {
+        const TIER1_CANDIDATES: &[(&str, bool)] = &[
+            // (section_name, apply_bcj)
+            ("__managedcode", true),
+            ("__unbox",       true),
+        ];
+        for (sec_name, apply_bcj) in TIER1_CANDIDATES {
             let Some(sec) = image.section(sec_name) else { continue };
             if sec.sh_type != SHT_PROGBITS || sec.sh_size == 0 {
                 continue;
@@ -547,15 +547,69 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
                 virtual_size,
                 original_protect: prot,
                 data: bytes,
-                apply_bcj: sec.sh_flags & SHF_EXECINSTR != 0,
+                apply_bcj: *apply_bcj && (sec.sh_flags & SHF_EXECINSTR != 0),
             });
             compressed_ranges.push((sec.sh_addr, sec.sh_size));
             tracing::info!(
                 section = sec_name,
                 rva = format!("{:#x}", target_rva),
                 size = virtual_size,
+                tier = 1,
                 "Phase E: absorbed section into payload"
             );
+        }
+
+        // Tier 2: page-level safe runs through layout::safe_ranges.
+        // We compute the forbidden set ONCE for the whole image, then
+        // ask each candidate section for the runs that survive after
+        // intersecting with the forbidden + page-padded blocks.
+        use upobf_elf::layout::safe_ranges::{
+            coalesce, collect_forbidden, pad_to_pages, safe_runs_in_section,
+            MIN_COMPRESS_RUN,
+        };
+        let forbidden = coalesce(collect_forbidden(&image.phdrs, &image.shdrs));
+        let pinned = pad_to_pages(&forbidden);
+        const TIER2_CANDIDATES: &[&str] = &[".rodata", ".dotnet_eh_table"];
+        for sec_name in TIER2_CANDIDATES {
+            let Some(sec) = image.section(sec_name) else { continue };
+            let runs = safe_runs_in_section(sec, &pinned);
+            if runs.is_empty() {
+                continue;
+            }
+            let total: u64 = runs.iter().map(|r| r.len).sum();
+            tracing::info!(
+                section = sec_name,
+                chunks = runs.len(),
+                absorbed_bytes = total,
+                tier = 2,
+                "Phase E: absorbed safe runs from section",
+            );
+            // sh_offset == sh_addr in the demo (first LOAD segment is
+            // identity-mapped) — but we cannot assume that in general.
+            // Translate run.vaddr through the original PT_LOAD walk.
+            for run in runs {
+                let file_off = image.vaddr_to_file_offset(run.vaddr)
+                    .with_context(|| format!("safe-run {:#x} -> file off", run.vaddr))?;
+                let end = file_off + run.len;
+                if end as usize > image.raw.len() {
+                    continue;
+                }
+                let bytes = image.raw[file_off as usize..end as usize].to_vec();
+                let target_rva: u32 = run.vaddr.try_into()
+                    .with_context(|| format!("safe-run vaddr {:#x} exceeds u32", run.vaddr))?;
+                let virtual_size: u32 = run.len.try_into()
+                    .context("safe-run len exceeds u32")?;
+                let prot = PF_R; // tier-2 candidates are R-only by design
+                chunk_inputs.push(PayloadInput {
+                    target_rva,
+                    virtual_size,
+                    original_protect: prot,
+                    data: bytes,
+                    apply_bcj: false, // .rodata is data, not instructions
+                });
+                compressed_ranges.push((run.vaddr, run.len));
+            }
+            let _ = MIN_COMPRESS_RUN;
         }
     }
 
