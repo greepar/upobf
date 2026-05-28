@@ -11,6 +11,12 @@ Cargo.lock.bak
 /stubs/**/*.lib
 /stubs/**/*.exp
 
+# Packed demo outputs (per-platform, all in repo root)
+/packed*.exe
+/packed*
+/demo/packed*.exe
+packed_e2e_*
+
 # IDE
 .vs/
 .vscode/

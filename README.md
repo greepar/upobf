@@ -32,7 +32,7 @@
   - **Phase G** 动态 libc API 解析：`/proc/self/maps` 走 GNU-hash → 8 个 API 槽（pthread/mmap/mprotect/prctl/clock_gettime…）；ChaCha20 解密 ApiTable，PR_SET_DUMPABLE=0 禁 coredump
   - **Phase F** pthread CRC32 watchdog：30 s 周期，IEEE 802.3 多项式逐字节实现（freestanding 禁可写全局），Avalonia 线程 +1
   - **Phase I** e_entry 重定向 + `.text` 压缩：rewrite ELF e_entry 到 stub 的 `upobf_entry_trampoline`，trampoline 跑完 `upobf_stub_init`（解压所有 chunk）后跳回 host 原 e_entry。**与 PE 不同**：glibc 的 main exe DT_INIT_ARRAY 由 `__libc_start_main` 调用（即 `_start` 之内），所以 init_array hook 来不及在 `_start` 读取压缩后的 `.text` 之前 fire；只能改 e_entry。
-- [ ] **V2** macOS Mach-O
+- [ ] **Phase K** macOS Mach-O (arm64) — see [`docs/phase-k-macos-arm64.md`](docs/phase-k-macos-arm64.md)
 
 ## 当前度量（PE demo: PatchInstaller.exe NativeAOT + Avalonia）
 
