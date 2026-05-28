@@ -23,7 +23,7 @@
 # new-pass-manager plugins on Windows.
 
 cmake_minimum_required(VERSION 3.20)
-project(upobf-passes CXX)
+project(upobf-passes C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,14 +66,26 @@ add_library(upobf-passes SHARED
 # LLVMConfig.cmake. `llvm_map_components_to_libnames` resolves a
 # logical component name (e.g. "core") to the concrete LLVM*.lib it
 # corresponds to in this build.
-llvm_map_components_to_libnames(LLVM_PASS_LIBS
-    core            # IR
-    support         # cl::opt, errs(), raw_ostream
-    transformutils  # BasicBlockUtils etc
-    analysis        # for FunctionAnalysisManager
-)
-
-target_link_libraries(upobf-passes PRIVATE ${LLVM_PASS_LIBS})
+#
+# Linux note: distros that ship `libLLVM-21.so` (Debian/Ubuntu's
+# llvm-21-dev package is one) have opt-21 / llc-21 dynamically
+# linked against that single SO. If we statically link our plugin
+# against the LLVM component .a's, cl::opt globals get registered
+# twice and the host abort()s with "inconsistency in registered
+# CommandLine options". To match the host, we prefer the single
+# shared `LLVM` library when it exists. On Windows the prebuilt
+# only ships per-component .lib's, so the static path remains.
+if (UNIX AND TARGET LLVM)
+    target_link_libraries(upobf-passes PRIVATE LLVM)
+else()
+    llvm_map_components_to_libnames(LLVM_PASS_LIBS
+        core            # IR
+        support         # cl::opt, errs(), raw_ostream
+        transformutils  # BasicBlockUtils etc
+        analysis        # for FunctionAnalysisManager
+    )
+    target_link_libraries(upobf-passes PRIVATE ${LLVM_PASS_LIBS})
+endif()
 
 # Note on diaguids.lib:
 #

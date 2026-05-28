@@ -4,9 +4,12 @@
 # Usage:
 #   ./tests/e2e/pack_run_verify_linux.sh
 #   ./tests/e2e/pack_run_verify_linux.sh path/to/binary
+#   ./tests/e2e/pack_run_verify_linux.sh --with-ir-pipeline
+#   ./tests/e2e/pack_run_verify_linux.sh --with-ir-pipeline --pass-seed 0x1234
 #
 # Steps:
-#   1. Build stub (stubs/elf-x64/build.sh)
+#   1. Build stub (stubs/elf-x64/build.sh) — optionally through the
+#      LLVM IR pass plugin (Phase H).
 #   2. Build packer (cargo build --release)
 #   3. Pack target binary
 #   4. Run packed binary, verify it survives N seconds
@@ -23,10 +26,30 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-INPUT_PATH="${1:-${REPO_ROOT}/Demo/PatchInstaller}"
+INPUT_PATH="${REPO_ROOT}/Demo/PatchInstaller"
 OUTPUT_PATH="${REPO_ROOT}/packed_e2e_linux"
 OUTPUT_PATH_B="${REPO_ROOT}/packed_e2e_linux_b"
 RUNTIME_SECONDS="${RUNTIME_SECONDS:-3}"
+WITH_IR_PIPELINE=0
+IR_PASS_SEED=0
+
+# Parse flags. Accept positional INPUT_PATH override as first non-flag arg.
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --with-ir-pipeline) WITH_IR_PIPELINE=1; shift ;;
+        --pass-seed) IR_PASS_SEED="$2"; shift 2 ;;
+        --pass-seed=*) IR_PASS_SEED="${1#*=}"; shift ;;
+        -h|--help)
+            echo "Usage: $0 [--with-ir-pipeline] [--pass-seed N] [INPUT_PATH]"
+            exit 0
+            ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+if [ ${#POSITIONAL[@]} -gt 0 ]; then
+    INPUT_PATH="${POSITIONAL[0]}"
+fi
 
 if [ ! -f "$INPUT_PATH" ]; then
     echo "[e2e] ERROR: input not found: $INPUT_PATH" >&2
@@ -40,8 +63,26 @@ fi
 # -----------------------------------------------------------------------------
 # Step 1: build stub
 # -----------------------------------------------------------------------------
+STUB_BUILD_ARGS=(--clean)
+if [ $WITH_IR_PIPELINE -eq 1 ]; then
+    PLUGIN="${REPO_ROOT}/tools/obfuscator-passes/build/upobf-passes.so"
+    if [ ! -f "$PLUGIN" ]; then
+        echo "[e2e] ERROR: --with-ir-pipeline set but plugin missing: $PLUGIN" >&2
+        echo "[e2e]   build with: tools/obfuscator-passes/build.sh" >&2
+        exit 3
+    fi
+    if [ "$IR_PASS_SEED" -eq 0 ]; then
+        # Derive a non-zero seed from current nanoseconds so successive
+        # runs produce visibly different stubs (useful when scanning for
+        # static signatures).
+        IR_PASS_SEED=$(( ($(date +%s%N) ) & 0xFFFFFFFF ))
+    fi
+    printf '[e2e] IR pipeline ENABLED (plugin=%s, seed=0x%08x)\n' "$PLUGIN" "$IR_PASS_SEED"
+    STUB_BUILD_ARGS+=(--pass-plugin "$PLUGIN" --pass-seed "$IR_PASS_SEED")
+fi
+
 echo "[e2e] Building stub..."
-"${REPO_ROOT}/stubs/elf-x64/build.sh" --clean | tail -10
+"${REPO_ROOT}/stubs/elf-x64/build.sh" "${STUB_BUILD_ARGS[@]}" | tail -10
 
 STUB_SO="${REPO_ROOT}/stubs/elf-x64/build/stub.so"
 if [ ! -f "$STUB_SO" ]; then
