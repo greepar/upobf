@@ -26,6 +26,7 @@
 #include "stub_runtime.h"
 #include "payload.h"
 #include "api_resolve.h"
+#include "watchdog.h"
 
 // ---------------------------------------------------------------------
 // Forward decls of the cross-platform crypto / compression / filter
@@ -302,35 +303,93 @@ void upobf_stub_init(void) {
 
     // ------------------------------------------------------------------
     // Phase G: resolve libc API table.
+    // Phase F: spawn background CRC watchdog over the just-decoded
+    //          chunks.
     //
-    // Done AFTER chunk decode so any decrypted payload sections that
-    // need protection are already in place; the resolver only reads
-    // /proc/self/maps + libc's already-mapped pages.
+    // Done AFTER chunk decode so the regions are in their final
+    // bytes before we baseline them. (When Phase I lands, OEP
+    // redirect must run between decode and baseline so the CRC
+    // reflects the post-redirect bytes; we leave a marker comment
+    // there for the next commit.)
     //
-    // The result feeds Phases F (pthread CRC watchdog) and I (OEP
-    // redirect). Even with neither wired in yet, we run the resolver
-    // here so a build regression in Phase G surfaces as visible
-    // breakage at the e2e level (the resolver wipes the API string
-    // table so even a no-op consumer is observable in /proc/<pid>/maps
-    // pressure tests).
+    // The resolver fills a ResolvedApis on the stack; on success
+    // we copy it into a fresh mmap'd page, allocate a WatchdogState
+    // alongside it, snapshot baseline CRCs, then pthread_create +
+    // pthread_detach. The thread holds the only references to the
+    // mmap pages after this function returns; they live for the
+    // lifetime of the host process.
     //
-    // We deliberately ignore failure: a resolver miss leaves Phases
-    // F/I disabled but doesn't keep Avalonia from running. The
-    // anti-coredump prctl below is the one immediate consumer.
+    // Resolver / spawn failure is silent: a failed install leaves
+    // the process running normally without integrity monitoring,
+    // matching the PE side's "partial unpack is less suspicious
+    // than hard fail" posture.
     // ------------------------------------------------------------------
     ResolvedApis apis = { 0 };
-    if (upobf_resolve_apis(ph, &apis) && apis.prctl) {
-        // PR_SET_DUMPABLE = 4. Setting it to 0 turns off ptrace
-        // attach + core dump generation for this process. Subsequent
-        // Phase F/I install steps will be added below this line in
-        // future commits.
-        const int UPOBF_PR_SET_DUMPABLE = 4;
-        apis.prctl(UPOBF_PR_SET_DUMPABLE, 0u, 0u, 0u, 0u);
+    if (upobf_resolve_apis(ph, &apis)) {
+        // Anti-coredump: PR_SET_DUMPABLE = 4, value 0 disables.
+        if (apis.prctl) {
+            apis.prctl(4, 0u, 0u, 0u, 0u);
+        }
+
+        // Snapshot baseline CRCs over each decoded chunk.
+        WatchdogRegion baselines[UPOBF_WATCHDOG_MAX_REGIONS];
+        uint32_t baseline_count = 0;
+        for (uint32_t i = 0; i < ph->chunk_count; i++) {
+            if (baseline_count >= UPOBF_WATCHDOG_MAX_REGIONS) break;
+            const ChunkEntry *ce = &chunks[i];
+            const uint8_t *region = (const uint8_t *)image_base + ce->target_rva;
+            baselines[baseline_count].ptr          = region;
+            baselines[baseline_count].len          = ce->virtual_size;
+            baselines[baseline_count].baseline_crc =
+                upobf_crc32(region, ce->virtual_size, 0u);
+            baseline_count++;
+        }
+
+        // Allocate a heap copy of ResolvedApis + WatchdogState in
+        // a single mmap page (~8 KiB total for 64 regions). We
+        // can't free this; the watchdog thread holds the only
+        // reference for the rest of the process lifetime.
+        size_t st_len  = sizeof(WatchdogState);
+        size_t api_len = sizeof(ResolvedApis);
+        size_t total   = (st_len + api_len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+        // Prefer apis->mmap (libc shim) since the watchdog is fully
+        // libc-driven once started; falls back to the raw syscall
+        // if the resolved slot is null (defensive).
+        void *heap = MAP_FAILED;
+        if (apis.mmap) {
+            heap = apis.mmap(0, total, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        }
+        if (heap == MAP_FAILED) {
+            heap = upobf_mmap(0, total, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        }
+        if (heap != MAP_FAILED) {
+            ResolvedApis *apis_copy = (ResolvedApis *)heap;
+            WatchdogState *ws = (WatchdogState *)((uint8_t *)heap + api_len);
+
+            // Copy resolved table.
+            for (size_t k = 0; k < api_len; k++) {
+                ((volatile uint8_t *)apis_copy)[k] = ((const uint8_t *)&apis)[k];
+            }
+
+            // Seed + start. seed_state copies baselines into ws->regions.
+            upobf_watchdog_seed_state(ws, apis_copy, baselines, baseline_count);
+            (void)upobf_watchdog_start(ws);
+        }
+
+        // Wipe the local baselines array — its contents have been
+        // copied into ws->regions on success. On failure, no harm
+        // done; this is just hygiene.
+        {
+            volatile uint8_t *zb = (volatile uint8_t *)baselines;
+            for (size_t k = 0; k < sizeof(baselines); k++) zb[k] = 0;
+        }
     }
 
-    // Wipe the local ResolvedApis. Future phases (F watchdog, I OEP
-    // install) will own a heap-allocated copy that survives this
-    // function; for M4L Phase G alone we don't keep state.
+    // Wipe the on-stack ResolvedApis. The watchdog (if it spawned)
+    // owns its own heap copy; this stack copy must not linger.
     {
         volatile uint8_t *zb = (volatile uint8_t *)&apis;
         for (size_t k = 0; k < sizeof(apis); k++) zb[k] = 0;
