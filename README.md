@@ -24,7 +24,7 @@
 - [x] **Phase I** OEP redirect + stolen bytes（iced-x86 LDE 解码 OEP prologue；PI 字节直拷、`call/jmp rel32` 重写为 abs 间接形式；packer 把原 prologue 替换成 `0xCC` 后再压缩；stub 解压完 VirtualAlloc 一页 trampoline + 14B abs-jmp 回 host，再把原 OEP 处int3 padding 写回成 `jmp [rip+0]; .quad <heap-VA>`；ProcessHacker dump 出来的 PE OEP 处指向堆 VA，重跑必崩）
 - [x] **Phase J / M0L–M4L** Linux ELF（x86_64）端到端：
   - **M0L** ELF parser（Ehdr/Phdr/Shdr/Dyn/Sym/Rela 全手写零 unsafe）
-  - **M1L** writer：phdr 表搬迁 + DT_INIT_ARRAY 注入 + .upobf{0,1,2} 三段 PT_LOAD
+  - **M1L** writer：phdr 表搬迁 + DT_INIT_ARRAY 注入 + .upobf{0,1,2} 三段 PT_LOAD + **PT_LOAD 切分压缩**（每个原 LOAD 围绕压缩洞分裂成 N+1 个子 LOAD，kernel 零填充 `memsz - filesz` 尾巴；从根本上让 packed 文件比原文件小）
   - **M2L** freestanding stub（pure RIP-relative，零重定位，纯 syscall，stub.so 一节 R+X）
   - **M3L** 端到端压缩：`__managedcode` + `__unbox` 全段压缩
   - **Phase E** 扩展段覆盖：`.text` / `.rodata` / `.dotnet_eh_table`（safe-runs 算法 + tier-1/tier-2 分级）
@@ -34,7 +34,7 @@
   - **Phase I** e_entry 重定向 + `.text` 压缩：rewrite ELF e_entry 到 stub 的 `upobf_entry_trampoline`，trampoline 跑完 `upobf_stub_init`（解压所有 chunk）后跳回 host 原 e_entry。**与 PE 不同**：glibc 的 main exe DT_INIT_ARRAY 由 `__libc_start_main` 调用（即 `_start` 之内），所以 init_array hook 来不及在 `_start` 读取压缩后的 `.text` 之前 fire；只能改 e_entry。
 - [ ] **V2** macOS Mach-O
 
-## 当前度量（demo: PatchInstaller.exe NativeAOT + Avalonia）
+## 当前度量（PE demo: PatchInstaller.exe NativeAOT + Avalonia）
 
 | 指标 | 值 |
 |---|---|
@@ -46,6 +46,19 @@
 | Packed 启动到首屏 | ~2-3 s |
 | Packed 运行时内存 | ~130 MB（与原版一致） |
 | Per-build SHA256 差异 | ✅（master_key/master_nonce 由 OsRng 派生） |
+
+## Linux 度量（同一 NativeAOT/Avalonia demo, ELF/PIE）
+
+| 指标 | 值 |
+|---|---|
+| 原大小 | 35.69 MB |
+| Packed 大小 | **14.99 MB** |
+| 压缩率 | **42.0%（节省 58%）** |
+| Pack 耗时 (release) | ~19 s |
+| Packed 启动到首屏 | ~2-3 s |
+| Packed 运行时 RSS | ~201 MB（与原版 ~189 MB 接近，stub + 解压 arena +12 MB） |
+| Packed 线程数 | 59（原版 58，+1 = Phase F watchdog） |
+| Per-build SHA256 差异 | ✅（OsRng 派生 master_key/master_nonce） |
 
 ## 工程布局
 
