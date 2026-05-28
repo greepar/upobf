@@ -254,7 +254,10 @@ else
     echo "[stub-build] link -shared -> $(basename "$SO")"
 fi
 "$LLD" -shared -Bsymbolic --no-undefined --no-dynamic-linker --gc-sections \
-    -nostdlib -e upobf_stub_init "${OBJS[@]}" -o "$SO"
+    -nostdlib -e upobf_stub_init \
+    --undefined=upobf_entry_trampoline \
+    --undefined=g_original_e_entry_rva \
+    "${OBJS[@]}" -o "$SO"
 
 # --- Report -----------------------------------------------------------
 echo ""

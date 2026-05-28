@@ -506,24 +506,37 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
     //
     // Two-tier strategy:
     //   1. Tier-1 candidates (whole-section): sections that ld.so /
-    //      libgcc / the C runtime never touch before init_array runs.
-    //      Right now: __managedcode, __unbox (NativeAOT JIT'd code,
-    //      only consumed by the .NET CLR after boot).
+    //      libgcc / the C runtime never touch before the stub
+    //      decompresses them. Right now: __managedcode, __unbox
+    //      (NativeAOT JIT'd code, only consumed by the .NET CLR
+    //      after boot) and `.text` (Phase I — covered by the
+    //      e_entry redirect).
     //   2. Tier-2 candidates (page-level safe runs): sections whose
     //      forbidden ranges (covered by `layout::safe_ranges`) we
     //      intersect against. Right now: .rodata, .dotnet_eh_table,
     //      .data.rel.ro after init.
     //
-    // .text + OEP-redirect lands in Phase I. .data is too dynamic
-    // (pthread tables / TLS templates) to compress safely.
+    // .data is too dynamic (pthread tables / TLS templates) to
+    // compress safely.
+    //
+    // Phase I (e_entry redirect): when the stub is available and we
+    // are compressing, we rewrite the ELF header `e_entry` to the
+    // stub's trampoline. The trampoline runs `upobf_stub_init`
+    // (which decompresses every chunk) and then jumps to the host's
+    // original entry point. This sidesteps the glibc-startup
+    // ordering issue where `_start` runs *before* DT_INIT_ARRAY for
+    // the main executable, which would otherwise crash on a zeroed
+    // `.text`.
     let mut chunk_inputs: Vec<PayloadInput> = Vec::new();
     let mut compressed_ranges: Vec<(u64, u64)> = Vec::new();
+    let phase_i_active = !no_compress && stub_blob.is_some();
 
     if !no_compress && stub_blob.is_some() {
         const TIER1_CANDIDATES: &[(&str, bool)] = &[
             // (section_name, apply_bcj)
             ("__managedcode", true),
             ("__unbox",       true),
+            (".text",         true), // Phase I — covered by e_entry redirect.
         ];
         for (sec_name, apply_bcj) in TIER1_CANDIDATES {
             let Some(sec) = image.section(sec_name) else { continue };
@@ -540,6 +553,7 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
                 .with_context(|| format!("{} vaddr exceeds u32", sec_name))?;
             let virtual_size: u32 = sec.sh_size.try_into()
                 .with_context(|| format!("{} size exceeds u32", sec_name))?;
+
             let mut prot = PF_R;
             if sec.sh_flags & SHF_EXECINSTR != 0 { prot |= PF_X; }
             chunk_inputs.push(PayloadInput {
@@ -641,23 +655,31 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
 
     if let Some(blob) = &stub_blob {
         // Pre-compute .upobf1 vaddr to bake into the stub. Mirror
-        // the writer's algorithm: upobf2 hosts the new init_array
-        // (8 bytes per entry, prepended by the stub init slot)
-        // followed by the new .rela.dyn (24 bytes per entry).
+        // the writer's algorithm: when init_array injection is
+        // disabled (Phase I path), .upobf2 is omitted entirely; the
+        // payload sits directly after .upobf0. When injection is
+        // enabled, .upobf2 hosts the new init_array (8 bytes per
+        // entry, prepended by the stub init slot) followed by the
+        // new .rela.dyn (24 bytes per entry).
         let stub_total = phdr_reserve + blob.bytes.len() as u64;
         let upobf0_size = align_up(stub_total, 0x1000);
 
-        // upobf2 size = init_array bytes + rela bytes, page-aligned.
-        // The writer always rebuilds .rela.dyn end-to-end when
-        // injecting, even though most entries are unchanged.
-        let host_init_count = image.dynamic.as_ref()
-            .and_then(|d| d.init_arraysz.map(|sz| sz / 8))
-            .unwrap_or(0);
-        let init_bytes = 8 * (1 + host_init_count);
-        let rela_bytes = (image.rela_dyn.len() as u64) * 24;
-        // 8-byte gap between init_array and rela.dyn (mirrors writer
-        // alignment).
-        let upobf2_size = align_up(init_bytes + rela_bytes, 0x1000);
+        // Phase I redirects e_entry to the stub trampoline; in that
+        // mode we drop init_array injection because the trampoline
+        // already runs `upobf_stub_init` before any host code. This
+        // also lets us skip emitting .upobf2 / new .rela.dyn, which
+        // saves a few KiB and removes one ld.so reloc-walk surface.
+        let inject_init_array = !phase_i_active;
+        let upobf2_size = if inject_init_array {
+            let host_init_count = image.dynamic.as_ref()
+                .and_then(|d| d.init_arraysz.map(|sz| sz / 8))
+                .unwrap_or(0);
+            let init_bytes = 8 * (1 + host_init_count);
+            let rela_bytes = (image.rela_dyn.len() as u64) * 24;
+            align_up(init_bytes + rela_bytes, 0x1000)
+        } else {
+            0
+        };
 
         let payload_va = if payload_bytes.is_some() {
             upobf0_vaddr + upobf0_size + upobf2_size
@@ -666,9 +688,25 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
         };
 
         let anchor_va = upobf0_vaddr + phdr_reserve + blob.image_base_anchor_offset;
+        let original_e_entry_rva = if phase_i_active {
+            image.ehdr.e_entry
+        } else {
+            0
+        };
         builder = builder
-            .with_stub(blob.patched(anchor_va, payload_va), blob.init_offset)
-            .enable_init_array_injection(true);
+            .with_stub(
+                blob.patched(anchor_va, payload_va, original_e_entry_rva),
+                blob.init_offset,
+            )
+            .enable_init_array_injection(inject_init_array);
+        if phase_i_active {
+            builder = builder.with_entry_redirect(blob.entry_trampoline_offset);
+            tracing::info!(
+                original_e_entry = format!("{:#x}", image.ehdr.e_entry),
+                trampoline_offset = format!("{:#x}", blob.entry_trampoline_offset),
+                "Phase I: e_entry redirect to stub trampoline",
+            );
+        }
     }
 
     if let Some(p) = payload_bytes {

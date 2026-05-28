@@ -27,8 +27,15 @@
 //!    DT_* tags; the original copies stay in place but are no
 //!    longer referenced.
 //!
-//! `e_entry` is **never** moved — Phase I OEP-stealing kicks in by
-//! patching the prologue at run time, same as the PE side.
+//! `e_entry` is rewritten to point at the stub's
+//! `upobf_entry_trampoline` when [`PackedElfBuilder::with_entry_redirect`]
+//! is enabled (Phase I). The trampoline runs the full stub init
+//! pipeline before jumping to the host's original entry point. PE
+//! Phase I uses prologue-stealing instead because Windows entry
+//! semantics differ; on glibc the main executable's
+//! `DT_INIT_ARRAY` runs from inside `__libc_start_main`, which
+//! itself is reached via `_start`, so an init_array hook can't
+//! fire before `_start` reads compressed `.text` bytes.
 //!
 //! # Constraints honoured by the writer
 //!
@@ -84,6 +91,13 @@ pub struct PackedElfBuilder<'a> {
     /// Combined with `.upobf0` base RVA + PHDR_TABLE_RESERVE to derive
     /// the absolute init function address written into `.init_array`.
     stub_init_offset: u64,
+    /// Phase I e_entry redirect. When `Some`, the writer rewrites the
+    /// ELF header `e_entry` to point at the stub's
+    /// `upobf_entry_trampoline` (offset given here, relative to stub
+    /// bytes). The trampoline runs the full stub init pipeline and
+    /// then jumps to the host's original entry point. Requires
+    /// `stub.is_some()`.
+    entry_trampoline_offset: Option<u64>,
     /// Half-open vaddr ranges whose bytes are zeroed in the output
     /// because the payload owns them now. The kernel maps zero pages
     /// at those vaddrs (filesz still covers them; but the on-disk
@@ -101,6 +115,7 @@ impl<'a> PackedElfBuilder<'a> {
             payload: None,
             inject_init_array: false,
             stub_init_offset: 0,
+            entry_trampoline_offset: None,
             compressed_ranges: Vec::new(),
         }
     }
@@ -118,6 +133,15 @@ impl<'a> PackedElfBuilder<'a> {
 
     pub fn enable_init_array_injection(mut self, on: bool) -> Self {
         self.inject_init_array = on;
+        self
+    }
+
+    /// Phase I: redirect the ELF header `e_entry` to the stub's
+    /// trampoline (offset given relative to the stub bytes). The
+    /// trampoline runs `upobf_stub_init`, then jumps to the host's
+    /// original entry point. Pass `None` to disable redirect.
+    pub fn with_entry_redirect(mut self, trampoline_offset: u64) -> Self {
+        self.entry_trampoline_offset = Some(trampoline_offset);
         self
     }
 
@@ -446,6 +470,17 @@ impl<'a> PackedElfBuilder<'a> {
         // e_phoff -> upobf0_file_off
         LittleEndian::write_u64(&mut out[0x20..0x28], upobf0_file_off);
         LittleEndian::write_u16(&mut out[0x38..0x3A], final_phnum as u16);
+
+        // Phase I: e_entry redirect. The ELF header's e_entry field
+        // (at offset 0x18, 8 bytes) is rewritten so the kernel
+        // transfers control to the stub's trampoline first. The
+        // trampoline runs `upobf_stub_init` (decompresses
+        // .text + everything else) then jumps to the host's
+        // original entry point.
+        if let Some(tramp_off) = self.entry_trampoline_offset {
+            let tramp_va = upobf0_vaddr + PHDR_TABLE_RESERVE + tramp_off;
+            LittleEndian::write_u64(&mut out[0x18..0x20], tramp_va);
+        }
 
         // ---- 6. Patch .dynamic -----------------------------------------
         if self.inject_init_array {

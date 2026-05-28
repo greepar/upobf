@@ -110,6 +110,18 @@ volatile uint64_t g_image_base_rva = 0xDEADBEEF00000000ull;
 __attribute__((aligned(16)))
 volatile uint8_t g_image_base_anchor = 0;
 
+// Phase I (e_entry redirect path): packer rewrites ELF header
+// `e_entry` to point at `upobf_entry_trampoline`. The trampoline
+// runs the full stub init pipeline (which decompresses `.text`
+// among other ranges), then jumps to the host's original
+// `e_entry`. The original `e_entry` RVA is stamped here so the
+// trampoline can recover it after running stub init. Sentinel
+// 0xDEADBEEFE0000001 is intentionally non-canonical — failure is
+// loud rather than silent: jumping into 0xDEADBEEFE0000001 will
+// SIGSEGV instead of sailing into a wrong region.
+__attribute__((aligned(16)))
+volatile uint64_t g_original_e_entry_rva = 0xDEADBEEFE0000001ull;
+
 // ---------------------------------------------------------------------
 // Decode pipeline
 // ---------------------------------------------------------------------
@@ -186,6 +198,83 @@ static int protect_range(uint8_t *va, size_t len, int prot) {
 // ---------------------------------------------------------------------
 
 void upobf_stub_init(void);
+
+// ---------------------------------------------------------------------
+// e_entry trampoline (Phase I)
+//
+// When the packer redirects ELF `e_entry` to point here, this is
+// the very first user code the kernel transfers control to —
+// before ld.so runs DT_INIT, DT_INIT_ARRAY, or any libc startup.
+//
+// Kernel-supplied register state on entry (System V x86_64 ABI):
+//   * `rdx` — function pointer to register with `atexit` (may be 0)
+//   * `rsp` — argv vector base (argc, argv[], envp[], auxv[])
+//   * all other GPRs — zero
+//   * direction flag — clear
+//
+// Our job:
+//   1. Save `rdx` (the only nonzero register the host's `_start`
+//      legitimately reads).
+//   2. Call `upobf_stub_init` (decompresses `.text` + everything
+//      else, runs Phase G/F).
+//   3. Restore `rdx`.
+//   4. Recover original `e_entry` RVA, add the load slide, jump
+//      to it. The host's `_start` then runs as if nothing
+//      happened.
+//
+// Implemented as a naked function: GCC/Clang would otherwise emit
+// a frame prologue that touches `rsp`, breaking the argv layout
+// the host's `_start` reads back via `[rsp]`.
+//
+// We do permit a 16-byte stack reserve (one push + push) so the
+// stack stays 16-byte aligned across the call to
+// `upobf_stub_init`. Kernel hands us `rsp` 16-byte aligned per the
+// ABI; pushing `rdx` (8 bytes) leaves it 8-aligned, which violates
+// the call-time alignment requirement, so we push twice (rdx + a
+// dummy) and pop both back.
+//
+// `g_image_base_anchor` + `g_image_base_rva` give us the slide
+// (same trick used inside `upobf_stub_init`); we re-derive it
+// here rather than hand it through a register so the trampoline
+// stays self-contained.
+// ---------------------------------------------------------------------
+
+__attribute__((naked, used, section(".text.upobf_entry")))
+void upobf_entry_trampoline(void) {
+    __asm__ volatile (
+        // Preserve rdx (atexit fnptr). rsp is 16-byte aligned at
+        // entry; push twice to keep it aligned for the call.
+        "pushq %%rdx\n\t"
+        "pushq %%rdx\n\t"
+
+        // Run the full stub init pipeline.
+        "call  upobf_stub_init\n\t"
+
+        // Restore rdx.
+        "popq  %%rdx\n\t"
+        "popq  %%rdx\n\t"
+
+        // Recover image_base = (&g_image_base_anchor) - g_image_base_rva
+        // and original entry = image_base + g_original_e_entry_rva.
+        // Use rax as scratch (host's _start expects rax = 0 only on
+        // some ABIs; most recent glibc _start tolerates any rax).
+        "leaq  g_image_base_anchor(%%rip), %%rax\n\t"
+        "subq  g_image_base_rva(%%rip), %%rax\n\t"
+        "addq  g_original_e_entry_rva(%%rip), %%rax\n\t"
+
+        // Zero rax-equivalent scratch register the host might
+        // observe. Actually the host's `_start` is the first thing
+        // jumped to, and the SysV ABI for `_start` says only rdx
+        // is meaningful; rax can be anything. We do clear rax
+        // after the jmp target is computed by stashing it in r11
+        // (volatile, not preserved across calls anyway) and
+        // jumping through r11 instead.
+        "movq  %%rax, %%r11\n\t"
+        "xorq  %%rax, %%rax\n\t"
+        "jmp   *%%r11\n\t"
+        : : :
+    );
+}
 
 // Force the symbol to be exported and pinned at the very start of
 // the stub `.text` section so the packer's `stub_init_offset`
@@ -280,17 +369,10 @@ void upobf_stub_init(void) {
 
         // Make target writable.
         if (protect_range(dst, ce->virtual_size, PROT_READ | PROT_WRITE) != 0) {
-            // mprotect failed — abort but keep the program runnable.
-            // (Skipping the chunk leaves zeros at target_rva, which is
-            //  what ld.so already mapped. Hosts that don't actually
-            //  use this RVA will keep working; ones that do will
-            //  crash later — failing fast here would be marginally
-            //  better but obscures the diagnostic in production.)
             continue;
         }
 
         if (decode_chunk(ce, ph, dst, (uint8_t *)scratch, scratch_len, &arena) != 0) {
-            // Same fail-soft posture.
             continue;
         }
 

@@ -44,6 +44,16 @@ pub struct StubBlob {
     pub image_base_rva_offset: u64,
     /// Offset of `g_image_base_anchor` byte.
     pub image_base_anchor_offset: u64,
+    /// Offset of `upobf_entry_trampoline` (Phase I e_entry redirect
+    /// target). The packer sets ELF header `e_entry` to
+    /// `upobf0_vaddr + PHDR_TABLE_RESERVE + entry_trampoline_offset`
+    /// when Phase I is enabled.
+    pub entry_trampoline_offset: u64,
+    /// Offset of `g_original_e_entry_rva` slot (8 bytes, LE u64).
+    /// Filled with the host's pre-redirect `e_entry` so the
+    /// trampoline can resume the host's startup after the stub
+    /// returns.
+    pub original_e_entry_rva_offset: u64,
 }
 
 impl StubBlob {
@@ -114,6 +124,14 @@ impl StubBlob {
             raw, symtab, strtab_off, strtab_end, "g_image_base_anchor"
         )
         .ok_or_else(|| anyhow!("stub g_image_base_anchor symbol missing"))?;
+        let entry_trampoline_offset = lookup_symbol(
+            raw, symtab, strtab_off, strtab_end, "upobf_entry_trampoline"
+        )
+        .ok_or_else(|| anyhow!("stub upobf_entry_trampoline symbol missing"))?;
+        let original_e_entry_rva_offset = lookup_symbol(
+            raw, symtab, strtab_off, strtab_end, "g_original_e_entry_rva"
+        )
+        .ok_or_else(|| anyhow!("stub g_original_e_entry_rva symbol missing"))?;
 
         Ok(StubBlob {
             bytes,
@@ -121,17 +139,31 @@ impl StubBlob {
             payload_vaddr_offset,
             image_base_rva_offset,
             image_base_anchor_offset,
+            entry_trampoline_offset,
+            original_e_entry_rva_offset,
         })
     }
 
-    /// Patch the three packer-managed slots and produce the final
+    /// Patch the four packer-managed slots and produce the final
     /// blob bytes ready to embed into `.upobf0`.
-    pub fn patched(&self, image_base_rva: u64, payload_vaddr: u64) -> Vec<u8> {
+    ///
+    /// `original_e_entry_rva` is `0` when Phase I (e_entry redirect)
+    /// is disabled; the trampoline never executes in that mode so
+    /// the slot value is irrelevant, but we still write 0 to keep
+    /// the sentinel from leaking into shipped artifacts.
+    pub fn patched(
+        &self,
+        image_base_rva: u64,
+        payload_vaddr: u64,
+        original_e_entry_rva: u64,
+    ) -> Vec<u8> {
         let mut out = self.bytes.clone();
         let off = self.image_base_rva_offset as usize;
         LittleEndian::write_u64(&mut out[off..off + 8], image_base_rva);
         let off = self.payload_vaddr_offset as usize;
         LittleEndian::write_u64(&mut out[off..off + 8], payload_vaddr);
+        let off = self.original_e_entry_rva_offset as usize;
+        LittleEndian::write_u64(&mut out[off..off + 8], original_e_entry_rva);
         out
     }
 }
