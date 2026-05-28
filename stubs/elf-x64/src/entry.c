@@ -41,10 +41,45 @@ void upobf_chacha20_xor(uint8_t *buf, uint32_t len,
 // lzma_dec.c — alone-format decoder. Signature mirrors PE side.
 int upobf_lzma_decompress_alone(const uint8_t *src, uint32_t src_len,
                                 uint8_t *dst, uint32_t dst_capacity,
-                                uint32_t *out_dst_size);
+                                uint32_t *out_dst_size,
+                                void *(*alloc_fn)(void *user, uint32_t),
+                                void  (*free_fn)(void *user, void *),
+                                void  *user);
 
 // bcj_x86.c
 void upobf_bcj_x86_backward(uint8_t *buf, uint32_t len, uint32_t base);
+
+// ---------------------------------------------------------------------
+// LZMA allocator backed by an mmap'd anon region. The decoder asks
+// for ~ a few hundred KiB of temporary state; we serve it from a
+// scratch arena allocated up-front in `upobf_stub_init`.
+// ---------------------------------------------------------------------
+//
+// Arena layout: a single growing-bump allocator. The decoder only
+// ever calls alloc/free in matched pairs around `LzmaDecode`; we
+// don't need a real freelist. Free is a no-op; the whole arena is
+// munmap'd at chunk-loop end.
+
+typedef struct {
+    uint8_t *base;
+    uint32_t cursor;
+    uint32_t capacity;
+} LzmaArena;
+
+static void *lzma_arena_alloc(void *user, uint32_t size) {
+    LzmaArena *a = (LzmaArena *)user;
+    // 16-byte align
+    a->cursor = (a->cursor + 15u) & ~15u;
+    if (a->cursor + size > a->capacity) return 0;
+    void *p = a->base + a->cursor;
+    a->cursor += size;
+    return p;
+}
+
+static void lzma_arena_free(void *user, void *p) {
+    (void)user; (void)p;
+    // no-op; arena is bulk-released after the chunk loop
+}
 
 // ---------------------------------------------------------------------
 // Packer-fixed-up data slot.
@@ -81,7 +116,8 @@ static int decode_chunk(const ChunkEntry *ce,
                         const PayloadHeader *ph,
                         uint8_t *target_va,
                         uint8_t *scratch,
-                        size_t scratch_len) {
+                        size_t scratch_len,
+                        LzmaArena *arena) {
     if (ce->data_size > scratch_len) return -1;
 
     // Working pointers into the encrypted blob.
@@ -105,9 +141,13 @@ static int decode_chunk(const ChunkEntry *ce,
     // pages must be writable; the caller arranges that.
     if (ce->flags & UPOBF_FLAG_LZMA) {
         uint32_t produced = 0;
+        // Reset the arena for this chunk so each call sees a fresh
+        // bump allocator (free is a no-op).
+        arena->cursor = 0;
         int rc = upobf_lzma_decompress_alone(
             scratch, ce->data_size,
-            target_va, ce->virtual_size, &produced);
+            target_va, ce->virtual_size, &produced,
+            lzma_arena_alloc, lzma_arena_free, arena);
         if (rc != 0 || produced != ce->virtual_size) return -2;
     } else {
         if (ce->data_size != ce->virtual_size) return -3;
@@ -202,6 +242,35 @@ void upobf_stub_init(void) {
                                -1, 0);
     if (scratch == MAP_FAILED) return;
 
+    // Allocate an LZMA arena. The decoder needs `numProbs *
+    // sizeof(CLzmaProb)` for the probability tables plus the
+    // dictionary (= max(1<<lc+lp, virtual_size) bytes). For typical
+    // upobf payloads (`lc=lp=0`, virtual_size up to ~16 MiB) this
+    // tops out at ~32 KiB of probs + ~16 MiB dict — round generously.
+    uint32_t arena_capacity = 0;
+    for (uint32_t i = 0; i < ph->chunk_count; i++) {
+        // dictionary size <= virtual_size for any sane LZMA stream
+        if (chunks[i].virtual_size > arena_capacity) {
+            arena_capacity = chunks[i].virtual_size;
+        }
+    }
+    // Add 256 KiB for probability tables / state.
+    arena_capacity += 256u * 1024u;
+    size_t arena_len = (arena_capacity + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    void *arena_base = upobf_mmap(0, arena_len,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                  -1, 0);
+    if (arena_base == MAP_FAILED) {
+        upobf_munmap(scratch, scratch_len);
+        return;
+    }
+    LzmaArena arena = {
+        .base = (uint8_t *)arena_base,
+        .cursor = 0,
+        .capacity = arena_capacity,
+    };
+
     // Walk chunks.
     for (uint32_t i = 0; i < ph->chunk_count; i++) {
         const ChunkEntry *ce = &chunks[i];
@@ -218,7 +287,7 @@ void upobf_stub_init(void) {
             continue;
         }
 
-        if (decode_chunk(ce, ph, dst, (uint8_t *)scratch, scratch_len) != 0) {
+        if (decode_chunk(ce, ph, dst, (uint8_t *)scratch, scratch_len, &arena) != 0) {
             // Same fail-soft posture.
             continue;
         }
@@ -227,5 +296,6 @@ void upobf_stub_init(void) {
         protect_range(dst, ce->virtual_size, (int)ce->original_protect);
     }
 
+    upobf_munmap(arena_base, arena_len);
     upobf_munmap(scratch, scratch_len);
 }

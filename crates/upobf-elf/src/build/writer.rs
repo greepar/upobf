@@ -84,6 +84,13 @@ pub struct PackedElfBuilder<'a> {
     /// Combined with `.upobf0` base RVA + PHDR_TABLE_RESERVE to derive
     /// the absolute init function address written into `.init_array`.
     stub_init_offset: u64,
+    /// Half-open vaddr ranges whose bytes are zeroed in the output
+    /// because the payload owns them now. The kernel maps zero pages
+    /// at those vaddrs (filesz still covers them; but the on-disk
+    /// bytes are 0); the stub's init_array callback writes the
+    /// decompressed bytes back via `mprotect(RW)` then restores the
+    /// original protection.
+    compressed_ranges: Vec<(u64, u64)>,
 }
 
 impl<'a> PackedElfBuilder<'a> {
@@ -94,6 +101,7 @@ impl<'a> PackedElfBuilder<'a> {
             payload: None,
             inject_init_array: false,
             stub_init_offset: 0,
+            compressed_ranges: Vec::new(),
         }
     }
 
@@ -110,6 +118,14 @@ impl<'a> PackedElfBuilder<'a> {
 
     pub fn enable_init_array_injection(mut self, on: bool) -> Self {
         self.inject_init_array = on;
+        self
+    }
+
+    /// Mark a `[vaddr, vaddr+len)` range as compressed by the
+    /// payload. The writer zeros the matching file bytes so the
+    /// kernel maps that region as zero-filled at run time.
+    pub fn mark_compressed_range(mut self, vaddr: u64, len: u64) -> Self {
+        self.compressed_ranges.push((vaddr, len));
         self
     }
 
@@ -315,6 +331,33 @@ impl<'a> PackedElfBuilder<'a> {
         // ---- 3. Materialise output buffer -------------------------------
         let mut out = vec![0u8; file_cursor as usize];
         out[..raw.len()].copy_from_slice(raw);
+
+        // Zero out compressed ranges in the host portion. The kernel
+        // maps zero pages at those vaddrs at run time; the stub
+        // mprotect(RW) -> writes decompressed bytes -> restores
+        // original protection. We translate vaddr ranges to file
+        // offsets via the original image's PT_LOAD walk.
+        for (vaddr, len) in &self.compressed_ranges {
+            if *len == 0 {
+                continue;
+            }
+            let file_off = self
+                .image
+                .vaddr_to_file_offset(*vaddr)
+                .with_context(|| {
+                    format!("compressed range vaddr {:#x} -> file off", vaddr)
+                })?;
+            let end = (file_off + len) as usize;
+            if end > raw.len() {
+                bail!(
+                    "compressed range past EOF: file 0x{:X}+0x{:X} > 0x{:X}",
+                    file_off, len, raw.len()
+                );
+            }
+            for b in &mut out[file_off as usize..end] {
+                *b = 0;
+            }
+        }
 
         // Write the new phdr table into .upobf0 head.
         write_phdr_table(

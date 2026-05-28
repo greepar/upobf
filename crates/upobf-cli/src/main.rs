@@ -472,17 +472,22 @@ fn cmd_pack(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bo
     }
 }
 
-fn cmd_pack_elf(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt: bool) -> Result<()> {
-    // M2L: link in the freestanding stub blob (when present), perform
-    // .init_array injection so the stub runs before host main(). M3L
-    // adds the payload chunk pipeline.
+fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt: bool) -> Result<()> {
+    // M3L: classify host sections, build a payload chunk per safe
+    // run, embed compressed bytes, ask the writer to zero out the
+    // host bytes so the kernel maps zero pages there. The stub
+    // decompresses + restores at startup.
+    use upobf_core::crypto::prng::Polymorphic;
+    use upobf_core::payload::{build_payload_v2, PayloadInput};
     use upobf_elf::build::{PackedElfBuilder, StubBlob};
+    use upobf_elf::parse::headers::{
+        PF_R, PF_X, SHF_EXECINSTR, SHT_PROGBITS,
+    };
 
     let image = upobf_elf::ElfImage::from_file(&input)
         .with_context(|| format!("failed to parse {}", input.display()))?;
 
-    // Locate the freestanding stub `.so`. Layout:
-    //   <crate root>/../../stubs/elf-x64/build/stub.so
+    // Locate the freestanding stub `.so`.
     let stub_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..").join("..").join("stubs").join("elf-x64").join("build").join("stub.so");
 
@@ -492,8 +497,79 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt
     } else {
         tracing::warn!(
             stub = %stub_path.display(),
-            "stub not built; falling back to passthrough mode (run stubs/elf-x64/build.sh)"
+            "stub not built; falling back to passthrough (run stubs/elf-x64/build.sh)"
         );
+        None
+    };
+
+    // ---- Classify candidate sections -----------------------------------
+    //
+    // M3L scope: only sections whose bytes are NOT touched between
+    // `e_entry` (= host `_start`, in `.text`) and the moment our
+    // init_array hook fires. That excludes `.text` itself: zeroing
+    // it would crash the host before our stub runs (the kernel
+    // jumps to `_start` directly).
+    //
+    // Safe candidates:
+    //   * `__managedcode` — NativeAOT JIT'd code, only used after
+    //     the .NET CLR boots, well after init_array.
+    //   * `__unbox` — same story.
+    //
+    // .rodata / .data.rel.ro / .data require forbidden-range
+    // coalescing (Phase E proper); deferred to M4L where we
+    // mirror the PE side's safe_runs_in_section pipeline.
+    //
+    // .text + OEP-redirect lands in M4L Phase I.
+    let mut chunk_inputs: Vec<PayloadInput> = Vec::new();
+    let mut compressed_ranges: Vec<(u64, u64)> = Vec::new();
+
+    if !no_compress && stub_blob.is_some() {
+        const COMPRESS_CANDIDATES: &[&str] = &["__managedcode", "__unbox"];
+        for sec_name in COMPRESS_CANDIDATES {
+            let Some(sec) = image.section(sec_name) else { continue };
+            if sec.sh_type != SHT_PROGBITS || sec.sh_size == 0 {
+                continue;
+            }
+            let file_off = sec.sh_offset as usize;
+            let end = file_off + sec.sh_size as usize;
+            if end > image.raw.len() {
+                continue;
+            }
+            let bytes = image.raw[file_off..end].to_vec();
+            let target_rva: u32 = sec.sh_addr.try_into()
+                .with_context(|| format!("{} vaddr exceeds u32", sec_name))?;
+            let virtual_size: u32 = sec.sh_size.try_into()
+                .with_context(|| format!("{} size exceeds u32", sec_name))?;
+            let mut prot = PF_R;
+            if sec.sh_flags & SHF_EXECINSTR != 0 { prot |= PF_X; }
+            chunk_inputs.push(PayloadInput {
+                target_rva,
+                virtual_size,
+                original_protect: prot,
+                data: bytes,
+                apply_bcj: sec.sh_flags & SHF_EXECINSTR != 0,
+            });
+            compressed_ranges.push((sec.sh_addr, sec.sh_size));
+            tracing::info!(
+                section = sec_name,
+                rva = format!("{:#x}", target_rva),
+                size = virtual_size,
+                "Phase E: absorbed section into payload"
+            );
+        }
+    }
+
+    // Compute layout cursors so we know where .upobf1 will sit before
+    // we ask the builder to do anything (the stub needs that vaddr).
+    let upobf0_vaddr = compute_upobf0_vaddr(&image)?;
+    let phdr_reserve = upobf_elf::build::writer::PHDR_TABLE_RESERVE;
+
+    let payload_bytes = if !chunk_inputs.is_empty() {
+        let poly = Polymorphic::from_os_rng();
+        let built = build_payload_v2(&chunk_inputs, ELF_API_NAMES, &poly, None)
+            .context("build payload")?;
+        Some(built.bytes)
+    } else {
         None
     };
 
@@ -502,40 +578,50 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt
         is_pie = image.is_pie(),
         phdrs = image.phdrs.len(),
         shdrs = image.shdrs.len(),
-        stub_bytes = stub_blob.as_ref().map(|s| s.bytes.len()).unwrap_or(0),
-        "ELF M2L pack"
+        chunks = chunk_inputs.len(),
+        payload_bytes = payload_bytes.as_ref().map(|p| p.len()).unwrap_or(0),
+        "ELF M3L pack"
     );
 
-    // The stub needs to know:
-    //  * its own .data slot offsets so the writer can patch them with
-    //    final image-base RVA + payload vaddr.
-    //  * the stub_init function offset within the blob.
     let mut builder = PackedElfBuilder::new(&image);
+
     if let Some(blob) = &stub_blob {
-        // M2L: empty payload, but we still call build with stub bytes
-        // so the stub runs at startup. The image_base_rva slot is
-        // patched here using the anchor offset.
-        // The anchor lives at offset `image_base_anchor_offset`
-        // inside the flat blob. Once embedded at
-        // `.upobf0_vaddr + PHDR_TABLE_RESERVE`, its runtime VA is
-        // `upobf0_vaddr + PHDR_TABLE_RESERVE + anchor_offset`. The
-        // RVA we bake in equals exactly that VA (since RVA == VA in
-        // ld.so's RELATIVE world for a PIE binary).
-        //
-        // We don't know the upobf0_vaddr until the writer computes
-        // layout, so we patch the slots inside the blob _after_
-        // calling build() — except the writer needs the post-patch
-        // bytes. Easiest fix: ask the writer to expose
-        // upobf0_vaddr; for now, we compute it ourselves with the
-        // same algorithm the writer uses.
-        let upobf0_vaddr = compute_upobf0_vaddr(&image)?;
-        let phdr_reserve = upobf_elf::build::writer::PHDR_TABLE_RESERVE;
+        // Pre-compute .upobf1 vaddr to bake into the stub. Mirror
+        // the writer's algorithm: upobf2 hosts the new init_array
+        // (8 bytes per entry, prepended by the stub init slot)
+        // followed by the new .rela.dyn (24 bytes per entry).
+        let stub_total = phdr_reserve + blob.bytes.len() as u64;
+        let upobf0_size = align_up(stub_total, 0x1000);
+
+        // upobf2 size = init_array bytes + rela bytes, page-aligned.
+        // The writer always rebuilds .rela.dyn end-to-end when
+        // injecting, even though most entries are unchanged.
+        let host_init_count = image.dynamic.as_ref()
+            .and_then(|d| d.init_arraysz.map(|sz| sz / 8))
+            .unwrap_or(0);
+        let init_bytes = 8 * (1 + host_init_count);
+        let rela_bytes = (image.rela_dyn.len() as u64) * 24;
+        // 8-byte gap between init_array and rela.dyn (mirrors writer
+        // alignment).
+        let upobf2_size = align_up(init_bytes + rela_bytes, 0x1000);
+
+        let payload_va = if payload_bytes.is_some() {
+            upobf0_vaddr + upobf0_size + upobf2_size
+        } else {
+            0
+        };
+
         let anchor_va = upobf0_vaddr + phdr_reserve + blob.image_base_anchor_offset;
-        let payload_va: u64 = 0; // M2L: no payload yet — stub bails on sentinel
-        let patched = blob.patched(anchor_va, payload_va);
         builder = builder
-            .with_stub(patched, blob.init_offset)
+            .with_stub(blob.patched(anchor_va, payload_va), blob.init_offset)
             .enable_init_array_injection(true);
+    }
+
+    if let Some(p) = payload_bytes {
+        builder = builder.with_payload(p);
+        for (va, len) in compressed_ranges {
+            builder = builder.mark_compressed_range(va, len);
+        }
     }
 
     let bytes = builder.build().context("build packed ELF")?;
@@ -550,17 +636,40 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt
 
     let orig = std::fs::metadata(&input)?.len();
     let pkt = std::fs::metadata(&output)?.len();
+    let delta = pkt as i64 - orig as i64;
+    let pct = (delta as f64 / orig as f64) * 100.0;
     println!(
-        "packed: {} -> {} ({} -> {} bytes, +{} bytes / +{:.2}%)",
+        "packed: {} -> {} ({} -> {} bytes, {:+} bytes / {:+.2}%)",
         input.display(),
         output.display(),
         orig,
         pkt,
-        pkt - orig,
-        ((pkt as f64 - orig as f64) / orig as f64) * 100.0,
+        delta,
+        pct,
     );
     Ok(())
 }
+
+fn align_up(v: u64, a: u64) -> u64 {
+    (v + a - 1) & !(a - 1)
+}
+
+/// API table the ELF stub will reference at runtime. M3L doesn't
+/// actually consume this (the stub runs without dlsym), but the
+/// payload builder requires a non-empty list to encode the header
+/// slot — we emit a Linux-flavoured set so the names look natural
+/// in case anyone scans the encrypted blob's pre-decryption length.
+const ELF_API_NAMES: &[(&str, &str)] = &[
+    ("libc.so.6", "mmap"),
+    ("libc.so.6", "mprotect"),
+    ("libc.so.6", "munmap"),
+    ("libc.so.6", "openat"),
+    ("libc.so.6", "read"),
+    ("libc.so.6", "close"),
+    ("libc.so.6", "ptrace"),
+    ("libc.so.6", "clock_gettime"),
+    ("libc.so.6", "exit"),
+];
 
 /// Compute the .upobf0 vaddr the writer will pick. Mirrors the
 /// algorithm in `PackedElfBuilder::build()`. Used by the CLI to
