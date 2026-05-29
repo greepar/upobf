@@ -116,6 +116,19 @@ pub fn collect_forbidden_in_section(image: &PeImage, sec: &SectionHeader) -> Vec
         }
     };
 
+    // Always pin the first SAFE_PAGE_SIZE of every candidate section.
+    //
+    // The writer's split-section path needs at least one real-byte
+    // fragment that starts at `sec_start` so the host's RVA range
+    // remains contiguously mapped. If the very first absorbed run
+    // were allowed to begin exactly at `sec_start`, the rewritten
+    // section would lose its original starting RVA, leaving an
+    // unmapped 1+ MiB hole in SizeOfImage and producing a binary the
+    // OS Loader rejects with "not a valid application for OS
+    // platform". Pinning the leading page is cheap (4 KiB on disk
+    // per packed section) and structurally guarantees a valid layout.
+    push(&mut out, sec.virtual_address, SAFE_PAGE_SIZE);
+
     // Bring in every relevant data directory verbatim. Some of these
     // are themselves trees (Import / Resource / Reloc) that fan out
     // into sub-tables; we walk those separately below to catch the
@@ -192,6 +205,16 @@ pub fn collect_forbidden_in_section(image: &PeImage, sec: &SectionHeader) -> Vec
                 .callbacks_va
                 .saturating_sub(image.nt.optional_header.image_base) as u32;
             push(&mut out, cb_array_rva, 32);
+        }
+        // TLS index slot: the OS Loader writes the per-process TLS
+        // slot number into this u32 *before* the TLS callbacks fire.
+        // Lives in `.data` for MSVC/NativeAOT layouts. Pin 8 bytes to
+        // cover any compiler-introduced alignment / sibling slot.
+        if tls.index_va != 0 {
+            let idx_rva = tls
+                .index_va
+                .saturating_sub(image.nt.optional_header.image_base) as u32;
+            push(&mut out, idx_rva, 8);
         }
         // The TLS Directory struct itself is already covered via IDX_TLS.
     }

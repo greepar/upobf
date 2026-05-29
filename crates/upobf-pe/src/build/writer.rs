@@ -673,8 +673,14 @@ impl<'a> BuildJob<'a> {
 
     fn assign_offsets(&mut self) -> Result<()> {
         // Compute SizeOfRawData and PointerToRawData for each section.
-        // We start placement past the headers (size_of_headers).
-        let header_room = self.builder.original.nt.optional_header.size_of_headers as usize;
+        // We start placement past the headers; the header reservation
+        // grows on demand to fit a section table that exceeds the
+        // host's original SizeOfHeaders. The extra reservation is
+        // a single file_alignment step (typically 0x200), enough for
+        // ~12 additional section headers — matches the worst case
+        // when both .rdata and .data get split into two fragments
+        // each on top of the existing stub / payload / reloc sections.
+        let header_room = self.required_size_of_headers() as usize;
         let mut cursor = align_up(header_room, self.file_alignment as usize) as u32;
         for s in &mut self.sections {
             if s.raw.is_empty() {
@@ -688,6 +694,22 @@ impl<'a> BuildJob<'a> {
             cursor += size;
         }
         Ok(())
+    }
+
+    /// Smallest SizeOfHeaders that still fits the new section table.
+    /// Returns at least the host's original SizeOfHeaders so we never
+    /// shrink a binary's header reservation; only grows when the new
+    /// section count exceeds what the original headers had room for.
+    fn required_size_of_headers(&self) -> u32 {
+        let nt_off = self.builder.original.dos.e_lfanew as usize;
+        let file_header_off = nt_off + 4;
+        let size_of_optional_header =
+            self.builder.original.nt.file_header.size_of_optional_header as usize;
+        let section_table_off = file_header_off + 20 + size_of_optional_header;
+        let needed = section_table_off + self.sections.len() * SECTION_HEADER_SIZE;
+        let original = self.builder.original.nt.optional_header.size_of_headers as usize;
+        let aligned = align_up(needed.max(original), self.file_alignment as usize);
+        aligned as u32
     }
 
     // ---------------------------------------------------------------
@@ -1157,9 +1179,17 @@ impl<'a> BuildJob<'a> {
 
         let mut out = vec![0u8; total_size as usize];
 
-        // Copy original headers unchanged.
-        let header_room = self.builder.original.nt.optional_header.size_of_headers as usize;
-        out[..header_room].copy_from_slice(&self.builder.original.raw[..header_room]);
+        // Copy original headers unchanged. The new header reservation
+        // may be larger than the host's original SizeOfHeaders if the
+        // section count exceeded the original header capacity; the
+        // extra bytes are left zero-initialised here and the section
+        // table is rewritten in `rewrite_headers` below.
+        let original_room = self.builder.original.nt.optional_header.size_of_headers as usize;
+        let new_room = self.required_size_of_headers() as usize;
+        out[..original_room].copy_from_slice(&self.builder.original.raw[..original_room]);
+        // Bytes [original_room .. new_room) stay zero — the section
+        // table writer will populate the entries that live there.
+        let _ = new_room;
 
         // Write each section's raw bytes.
         for s in &self.sections {
@@ -1188,15 +1218,22 @@ impl<'a> BuildJob<'a> {
         let section_table_off = file_header_off + 20 + size_of_optional_header;
 
         let new_section_count = self.sections.len();
+        let new_size_of_headers = self.required_size_of_headers() as usize;
         let needed = section_table_off + new_section_count * SECTION_HEADER_SIZE;
-        let size_of_headers = self.builder.original.nt.optional_header.size_of_headers as usize;
-        if needed > size_of_headers {
+        if needed > new_size_of_headers {
             bail!(
-                "new section table needs {:#x} bytes but SizeOfHeaders is only {:#x}",
-                needed,
-                size_of_headers
+                "internal: required_size_of_headers ({:#x}) is below table end ({:#x})",
+                new_size_of_headers,
+                needed
             );
         }
+
+        // OptionalHeader.SizeOfHeaders (offset +60 in the OptionalHeader,
+        // PE32+ layout). Update if grew.
+        LittleEndian::write_u32(
+            &mut out[optional_header_off + 60..optional_header_off + 64],
+            new_size_of_headers as u32,
+        );
 
         // FileHeader.NumberOfSections
         LittleEndian::write_u16(
@@ -1309,8 +1346,8 @@ impl<'a> BuildJob<'a> {
         // SizeOfHeaders to avoid surprising the OS Loader with stale
         // section headers from the original file.
         let new_table_end = section_table_off + new_section_count * SECTION_HEADER_SIZE;
-        if new_table_end < size_of_headers {
-            for b in &mut out[new_table_end..size_of_headers] {
+        if new_table_end < new_size_of_headers {
+            for b in &mut out[new_table_end..new_size_of_headers] {
                 *b = 0;
             }
         }

@@ -728,10 +728,13 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
     std::fs::write(&output, &bytes)
         .with_context(|| format!("write {}", output.display()))?;
 
-    use std::os::unix::fs::PermissionsExt;
-    let mut perm = std::fs::metadata(&output)?.permissions();
-    perm.set_mode(perm.mode() | 0o755);
-    std::fs::set_permissions(&output, perm)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&output)?.permissions();
+        perm.set_mode(perm.mode() | 0o755);
+        std::fs::set_permissions(&output, perm)?;
+    }
 
     let orig = std::fs::metadata(&input)?.len();
     let pkt = std::fs::metadata(&output)?.len();
@@ -967,7 +970,7 @@ fn cmd_pack_pe(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt:
                 });
                 compressed_ranges.push((sec.virtual_address, pack_len as u32));
             }
-            ".rdata" => {
+            ".rdata" | ".data" => {
                 use upobf_pe::layout::safe_ranges::{
                     coalesce, collect_forbidden_in_section, pad_to_pages, safe_runs_in_section,
                 };
@@ -994,8 +997,9 @@ fn cmd_pack_pe(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt:
                         virtual_size: run.len,
                         original_protect: section_protect_for_chars(sec.characteristics),
                         data,
-                        // .rdata holds non-instruction data (strings,
-                        // type metadata, NativeAOT method tables);
+                        // Both .rdata and .data hold non-instruction
+                        // data (strings, type metadata, NativeAOT
+                        // method tables, frozen-heap String objects);
                         // BCJ would mangle it.
                         apply_bcj: false,
                     });
@@ -1010,7 +1014,7 @@ fn cmd_pack_pe(input: PathBuf, output: PathBuf, _no_compress: bool, _no_encrypt:
                         chunks = runs.len(),
                         absorbed_bytes = total,
                         forbidden_blocks = pinned.len(),
-                        "Phase E: absorbed safe runs from section",
+                        "Phase E/J: absorbed safe runs from section",
                     );
                 }
             }

@@ -22,6 +22,7 @@
 - [x] **Phase F** 后台 CRC32 watchdog 线程（每 30 s 重算 chunk 基线；不退出，mismatch 异或进 heap 内 seed；packed.exe 线程数 +1）
 - [x] **Phase H** `upobf-cff` 控制流扁平化（DemoteRegToStack + dispatcher loop with PRNG-scrambled state IDs；entry/anti_debug/api_resolve/watchdog 走 cff，chacha20/bcj_x86/lzma_dec 豁免）
 - [x] **Phase I** OEP redirect + stolen bytes（iced-x86 LDE 解码 OEP prologue；PI 字节直拷、`call/jmp rel32` 重写为 abs 间接形式；packer 把原 prologue 替换成 `0xCC` 后再压缩；stub 解压完 VirtualAlloc 一页 trampoline + 14B abs-jmp 回 host，再把原 OEP 处int3 padding 写回成 `jmp [rip+0]; .quad <heap-VA>`；ProcessHacker dump 出来的 PE OEP 处指向堆 VA，重跑必崩）
+- [x] **Phase L (PE)** `.data` 分块压缩 + SizeOfHeaders 自动扩展（NativeAOT frozen-heap 字符串不在 `.rdata` 而在 `.data`，未压时业务 URL/key/method 名仍可静态 grep；扩 safe_ranges 到 `.data`，pin TLS index slot + section 头一页；writer 自动按 file_alignment 扩 SizeOfHeaders 容纳额外 section header；demo 从 18.39 MiB 砍到 16.86 MiB / 37.6%；`hentaiaid`/`ec192wapi`/`steamPatch`/`CurrentMd5` 等业务字符串静态命中归零）
 - [x] **Phase J / M0L–M4L** Linux ELF（x86_64）端到端：
   - **M0L** ELF parser（Ehdr/Phdr/Shdr/Dyn/Sym/Rela 全手写零 unsafe）
   - **M1L** writer：phdr 表搬迁 + DT_INIT_ARRAY 注入 + .upobf{0,1,2} 三段 PT_LOAD + **PT_LOAD 切分压缩**（每个原 LOAD 围绕压缩洞分裂成 N+1 个子 LOAD，kernel 零填充 `memsz - filesz` 尾巴；从根本上让 packed 文件比原文件小）
