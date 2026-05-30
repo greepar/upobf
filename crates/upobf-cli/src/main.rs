@@ -488,7 +488,7 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
     use upobf_core::payload::{build_payload_v2, PayloadInput};
     use upobf_elf::build::{PackedElfBuilder, StubBlob};
     use upobf_elf::parse::headers::{
-        PF_R, PF_X, SHF_EXECINSTR, SHT_PROGBITS,
+        PF_R, PF_W, PF_X, SHF_EXECINSTR, SHT_PROGBITS,
     };
 
     let image = upobf_elf::ElfImage::from_file(&input)
@@ -584,15 +584,35 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
         // We compute the forbidden set ONCE for the whole image, then
         // ask each candidate section for the runs that survive after
         // intersecting with the forbidden + page-padded blocks.
+        //
+        // Phase M: extend forbidden with dynamic-relocation slots,
+        // glibc early-access globals, and PT_GNU_RELRO ranges so
+        // .data + .data.rel.ro can safely join the candidate list.
         use upobf_elf::layout::safe_ranges::{
-            coalesce, collect_forbidden, pad_to_pages, safe_runs_in_section,
-            MIN_COMPRESS_RUN,
+            coalesce, collect_forbidden, collect_forbidden_critical_globals,
+            collect_forbidden_relocs, collect_forbidden_relro, pad_to_pages,
+            pin_section_head, safe_runs_in_section, MIN_COMPRESS_RUN,
         };
-        let forbidden = coalesce(collect_forbidden(&image.phdrs, &image.shdrs));
-        let pinned = pad_to_pages(&forbidden);
-        const TIER2_CANDIDATES: &[&str] = &[".rodata", ".dotnet_eh_table"];
-        for sec_name in TIER2_CANDIDATES {
+        let mut forbidden = collect_forbidden(&image.phdrs, &image.shdrs);
+        forbidden.extend(collect_forbidden_relocs(&image.rela_dyn, &image.phdrs));
+        forbidden.extend(collect_forbidden_critical_globals(&image.dynsym));
+        forbidden.extend(collect_forbidden_relro(&image.phdrs));
+        let forbidden = coalesce(forbidden);
+
+        const TIER2_CANDIDATES: &[(&str, u32)] = &[
+            (".rodata",         PF_R),
+            (".dotnet_eh_table", PF_R),
+            (".data.rel.ro",    PF_R | PF_W),
+            (".data",           PF_R | PF_W),
+        ];
+        for (sec_name, prot) in TIER2_CANDIDATES {
             let Some(sec) = image.section(sec_name) else { continue };
+            // Pin the leading page of each candidate section so the
+            // writer's split-LOAD path can't shift the start RVA
+            // (mirrors PE Phase L head-page pin).
+            let mut local_forbidden = forbidden.clone();
+            local_forbidden.push(pin_section_head(sec));
+            let pinned = pad_to_pages(&coalesce(local_forbidden));
             let runs = safe_runs_in_section(sec, &pinned);
             if runs.is_empty() {
                 continue;
@@ -603,7 +623,7 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
                 chunks = runs.len(),
                 absorbed_bytes = total,
                 tier = 2,
-                "Phase E: absorbed safe runs from section",
+                "Phase E/M: absorbed safe runs from section",
             );
             // sh_offset == sh_addr in the demo (first LOAD segment is
             // identity-mapped) — but we cannot assume that in general.
@@ -620,13 +640,12 @@ fn cmd_pack_elf(input: PathBuf, output: PathBuf, no_compress: bool, _no_encrypt:
                     .with_context(|| format!("safe-run vaddr {:#x} exceeds u32", run.vaddr))?;
                 let virtual_size: u32 = run.len.try_into()
                     .context("safe-run len exceeds u32")?;
-                let prot = PF_R; // tier-2 candidates are R-only by design
                 chunk_inputs.push(PayloadInput {
                     target_rva,
                     virtual_size,
-                    original_protect: prot,
+                    original_protect: *prot,
                     data: bytes,
-                    apply_bcj: false, // .rodata is data, not instructions
+                    apply_bcj: false, // data sections are not instructions
                 });
                 compressed_ranges.push((run.vaddr, run.len));
             }

@@ -39,8 +39,11 @@
 //! builder.
 
 use crate::parse::headers::{
-    Elf64Phdr, Elf64Shdr, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_INTERP, PT_NOTE, PT_PHDR,
+    Elf64Phdr, Elf64Shdr, PF_W, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_INTERP, PT_LOAD,
+    PT_NOTE, PT_PHDR,
 };
+use crate::parse::relocations::Rela;
+use crate::parse::symbols::DynSymbol;
 
 /// Compression page granularity. ld.so maps segments at 4 KiB on
 /// x86_64 so the safe/forbidden split happens at the natural memory
@@ -148,6 +151,80 @@ pub fn collect_forbidden(
     }
 
     out
+}
+
+/// Pin every byte ld.so writes via dynamic relocation BEFORE the
+/// stub's init_array hook fires. Each rela's `r_offset` is an 8-byte
+/// slot the loader overwrites with a resolved address / value. We only
+/// pin offsets that land inside RW LOAD segments (the packer's
+/// compression targets); text relocations are irrelevant here.
+pub fn collect_forbidden_relocs(
+    rela_dyn: &[Rela],
+    phdrs: &[Elf64Phdr],
+) -> Vec<Range> {
+    // Build a list of RW LOAD vaddr ranges.
+    let rw_loads: Vec<(u64, u64)> = phdrs
+        .iter()
+        .filter(|p| p.p_type == PT_LOAD && (p.p_flags & PF_W) != 0)
+        .map(|p| (p.p_vaddr, p.p_vaddr + p.p_memsz))
+        .collect();
+
+    let in_rw_load = |va: u64| -> bool {
+        rw_loads.iter().any(|(lo, hi)| va >= *lo && va < *hi)
+    };
+
+    rela_dyn
+        .iter()
+        .filter(|r| in_rw_load(r.r_offset))
+        .map(|r| Range::new(r.r_offset, 8))
+        .collect()
+}
+
+/// Pin glibc's early-access globals that ld.so / the C runtime write
+/// before init_array fires. Each matched symbol gets 16 bytes pinned
+/// (8 for the slot + 8 guard for compiler-introduced sibling padding).
+/// Only defined (non-undefined) symbols are considered.
+pub fn collect_forbidden_critical_globals(
+    dynsym: &[DynSymbol],
+) -> Vec<Range> {
+    const CRITICAL_NAMES: &[&str] = &[
+        "__stack_chk_guard",
+        "__libc_start_main",
+        "__libc_argc",
+        "__libc_argv",
+        "_environ",
+        "__environ",
+        "environ",
+        "__progname",
+        "__progname_full",
+        "_dl_argv",
+    ];
+
+    dynsym
+        .iter()
+        .filter(|s| !s.is_undefined() && s.st_value != 0)
+        .filter(|s| CRITICAL_NAMES.iter().any(|n| s.name == *n))
+        .map(|s| Range::new(s.st_value, 16))
+        .collect()
+}
+
+/// Pin every `PT_GNU_RELRO` range. ld.so applies `mprotect(R)` over
+/// these pages after relocations but before init_array fires, so any
+/// stub writes there would race with the loader's protection change.
+/// Pinning the entire RELRO region is the safest strategy.
+pub fn collect_forbidden_relro(phdrs: &[Elf64Phdr]) -> Vec<Range> {
+    phdrs
+        .iter()
+        .filter(|p| p.p_type == PT_GNU_RELRO && p.p_memsz > 0)
+        .map(|p| Range::new(p.p_vaddr, p.p_memsz))
+        .collect()
+}
+
+/// Pin the leading page of a candidate section so the writer's
+/// split-section path can't shift the section start RVA. Mirrors
+/// PE Phase L's `collect_forbidden_in_section` head-page pin.
+pub fn pin_section_head(sec: &Elf64Shdr) -> Range {
+    Range::new(sec.sh_addr, SAFE_PAGE_SIZE)
 }
 
 /// Sort + merge overlapping/adjacent ranges.
@@ -316,5 +393,93 @@ mod tests {
         let runs = safe_runs_in_section(&sec, &forbidden);
         // Head run 0x10000..0x20000 (64 KiB), tail run 0x21000..0x50000 (188 KiB).
         assert_eq!(runs, vec![r(0x10000, 0x10000), r(0x21000, 0x2F000)]);
+    }
+
+    #[test]
+    fn forbidden_relocs_picks_up_rw_load_only() {
+        use crate::parse::headers::{PF_R, PF_W, PF_X, PT_LOAD};
+        use crate::parse::relocations::Rela;
+
+        // Two LOADs: one R-only, one RW.
+        let phdrs = vec![
+            Elf64Phdr {
+                p_type: PT_LOAD, p_flags: PF_R,
+                p_offset: 0, p_vaddr: 0x1000, p_paddr: 0x1000,
+                p_filesz: 0x10000, p_memsz: 0x10000, p_align: 0x1000,
+            },
+            Elf64Phdr {
+                p_type: PT_LOAD, p_flags: PF_R | PF_W,
+                p_offset: 0x20000, p_vaddr: 0x20000, p_paddr: 0x20000,
+                p_filesz: 0x10000, p_memsz: 0x10000, p_align: 0x1000,
+            },
+        ];
+        let relas = vec![
+            Rela { r_offset: 0x2000, r_info: 8, r_addend: 0 },  // in R-only LOAD
+            Rela { r_offset: 0x25000, r_info: 8, r_addend: 0 }, // in RW LOAD
+            Rela { r_offset: 0x28000, r_info: 8, r_addend: 0 }, // in RW LOAD
+        ];
+        let result = collect_forbidden_relocs(&relas, &phdrs);
+        // Only the two in RW LOAD should be pinned.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], r(0x25000, 8));
+        assert_eq!(result[1], r(0x28000, 8));
+    }
+
+    #[test]
+    fn forbidden_critical_globals_skips_undefined() {
+        use crate::parse::symbols::DynSymbol;
+
+        let syms = vec![
+            DynSymbol {
+                name: "__stack_chk_guard".into(),
+                st_name: 1, st_info: 0x11, st_other: 0,
+                st_shndx: 10, // defined
+                st_value: 0x30000, st_size: 8,
+            },
+            DynSymbol {
+                name: "environ".into(),
+                st_name: 2, st_info: 0x11, st_other: 0,
+                st_shndx: 0, // undefined
+                st_value: 0, st_size: 0,
+            },
+            DynSymbol {
+                name: "__progname".into(),
+                st_name: 3, st_info: 0x11, st_other: 0,
+                st_shndx: 12, // defined
+                st_value: 0x30100, st_size: 8,
+            },
+            DynSymbol {
+                name: "unrelated_func".into(),
+                st_name: 4, st_info: 0x12, st_other: 0,
+                st_shndx: 5,
+                st_value: 0x40000, st_size: 16,
+            },
+        ];
+        let result = collect_forbidden_critical_globals(&syms);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], r(0x30000, 16));
+        assert_eq!(result[1], r(0x30100, 16));
+    }
+
+    #[test]
+    fn forbidden_relro_covers_pt_gnu_relro() {
+        use crate::parse::headers::PT_GNU_RELRO;
+
+        let phdrs = vec![
+            Elf64Phdr {
+                p_type: PT_GNU_RELRO, p_flags: 4,
+                p_offset: 0, p_vaddr: 0x50000, p_paddr: 0x50000,
+                p_filesz: 0x2000, p_memsz: 0x3000, p_align: 1,
+            },
+        ];
+        let result = collect_forbidden_relro(&phdrs);
+        assert_eq!(result, vec![r(0x50000, 0x3000)]);
+    }
+
+    #[test]
+    fn pin_section_head_returns_first_page() {
+        let sec = fake_section(".data", 0x234b600, 0x67ff8, SHT_PROGBITS);
+        let pinned = pin_section_head(&sec);
+        assert_eq!(pinned, r(0x234b600, SAFE_PAGE_SIZE));
     }
 }
